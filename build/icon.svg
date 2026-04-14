@@ -1,0 +1,8 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background with rounded corners (macOS icon shape) -->
+  <rect width="1024" height="1024" rx="228" fill="#FAF8F5"/>
+  <!-- Solid circle -->
+  <circle cx="400" cy="512" r="200" fill="#2C2520"/>
+  <!-- Semi-transparent circle -->
+  <circle cx="600" cy="512" r="200" fill="#2C2520" opacity="0.35"/>
+</svg>

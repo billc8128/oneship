@@ -1,0 +1,56 @@
+@import '@fontsource-variable/funnel-sans';
+@import '@fontsource/geist-sans/400.css';
+@import '@fontsource/geist-sans/500.css';
+@import '@fontsource/geist-sans/600.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
+@import 'tailwindcss';
+@config '../../../tailwind.config.js';
+
+body {
+  font-family: 'Geist', system-ui, sans-serif;
+  background-color: #FAF8F5;
+  color: #2C2520;
+  overflow: hidden;
+  height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Reserve a small end gutter so overlay scrollbars never sit on top of
+   the last terminal column. xterm's FitAddon subtracts .xterm padding
+   from available width, so this also nudges wrapping one column earlier. */
+.xterm {
+  box-sizing: border-box;
+  padding-right: 10px;
+}
+
+/* xterm.js scrollbar — thin, subtle, like Ghostty */
+.xterm .xterm-viewport {
+  scrollbar-gutter: stable;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(44, 37, 32, 0.15);
+  border-radius: 3px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(44, 37, 32, 0.3);
+}
