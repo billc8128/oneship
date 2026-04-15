@@ -960,10 +960,12 @@ When `checkPermission` returns `prompt-needed`, the tool call is suspended. The 
    - **Deny** → `resolution: { kind: 'permission-deny' }`, no `stateUpdate`.
 7. Worker's resolution handler:
    a. Applies `stateUpdate` (if present) — adds to `session.allowOnceClasses`.
-   b. For **Allow** / **Allow Always**: **actually invokes the tool now**, outside of any `runSegment`. The wrapper synthesizes a fresh `ExecContext` using the session, the toolCallId from the SuspensionSpec, and a new `AbortController` tied to `session.currentAbortController`. It runs `inner(args, ctx)` for local tools, or sends `rpc.request { kind: 'tool.exec' }` to main for rpc tools. The return value is the real tool output (a string for Read, a `{stdout, stderr, exitCode}` for Bash, etc.). If the executor throws, it becomes `{error, hint?}`.
+   b. For **Allow** / **Allow Always**: **actually invokes the tool now**, outside of any `runSegment`. The handler creates a **new `AbortController` and stores it in `session.currentResolutionAbortController`** — a separate field from `session.currentAbortController` (which belongs to the now-defunct suspended `runLoop` invocation and is `null` at this point). The handler synthesizes an `ExecContext` using the session, the toolCallId from the SuspensionSpec, and the new controller's `signal`. It runs `inner(args, ctx)` for local tools, or sends `rpc.request { kind: 'tool.exec' }` to main for rpc tools (the rpc envelope carries the signal so main can propagate abort to the child process). The return value is the real tool output (a string for Read, a `{stdout, stderr, exitCode}` for Bash, etc.). If the executor throws, it becomes `{error, hint?}`. In the `finally` block the handler clears `session.currentResolutionAbortController = null`.
    c. For **Deny**: skip tool execution. The resolved result is `{error: 'user-denied'}`.
    d. Emits a single `part-update` replacing the `{__suspended: true}` placeholder with the resolved tool-result (the real tool output, or `{error: 'user-denied'}`).
    e. Deletes `suspension.json`, clears `pendingSuspension`.
+
+   **Invariant**: `session.currentAbortController` and `session.currentResolutionAbortController` are never both non-null at the same time. `currentAbortController` is only set while a `runLoop` is actively streaming; `currentResolutionAbortController` is only set while a resolution handler is executing a deferred tool. A `cancel-current-turn` IPC must abort whichever is non-null (or both if, pathologically, both are); see §15.5 cancellation notes.
 8. Worker triggers a new `runLoop` iteration. The LLM sees a normal `tool_use → tool_result` pair in its history — the tool_result is either the real output or a user-denied error. **No synthetic user message is appended.** The Anthropic API requires that every `tool_use` be paired with exactly one `tool_result` (§15.5); the placeholder rewrite IS that tool_result. Appending an extra user message would violate the protocol.
 9. On the next segment, the LLM reads the history and decides its own next step: for Allow, the tool output is there and the LLM continues naturally; for Deny, it typically tries a different approach or asks the user why.
 
@@ -1472,7 +1474,9 @@ interface SessionRuntime {
   deferredSuspensions: SuspensionSpec[]        // parallel-tool-call losers (Phase 2b — Phase 2a uses invariant check instead)
   allowOnceClasses: Set<ApprovalClass>         // Phase 2a — allow-always allowlist, session-scoped
   singleUseApprovals: Set<string>              // Phase 2a — single-use permission keys, consumed on hit
-  abortController: AbortController | null
+  // Two AbortControllers, mutually exclusive (see §12.3 step 7 invariant):
+  currentAbortController: AbortController | null            // live only while runLoop is streaming
+  currentResolutionAbortController: AbortController | null  // live only while a resolution handler is executing a deferred tool
   segmentInProgress: boolean
 }
 

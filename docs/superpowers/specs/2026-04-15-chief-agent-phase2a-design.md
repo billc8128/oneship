@@ -454,8 +454,8 @@ When `checkPermission` returns `prompt-needed`:
 10. Worker's **resolution handler** (not in any `runSegment`):
     a. Applies `stateUpdate` (if present) — adds `approvalClass` to `session.allowOnceClasses`.
     b. Builds the resolved tool_result according to the resolution kind:
-       - **permission-allow / permission-allow-always**: synthesizes an `ExecContext` using the session, the toolCallId from the SuspensionSpec, and a new `AbortController` tied to `session.currentAbortController`. **Invokes the tool's real executor** — for `execution: 'local'` tools, calls the inner function directly; for `execution: 'rpc'` tools, sends `rpc.request { kind: 'tool.exec' }` to main and awaits the response. The resolved tool_result is the real output on success, or `{error, hint?}` on failure (the wrapper's normal error path, see §6.2). **The guard check (path-guard etc.) still runs** — the resolution handler reuses the same `wrap*Tool`-style preamble to ensure the deferred execution gets the same safety checks as a regular invocation.
-       - **permission-deny**: resolved tool_result is `{error: 'user-denied'}`.
+       - **permission-allow / permission-allow-always**: creates a **new `AbortController` and assigns it to `session.currentResolutionAbortController`**. This is distinct from `session.currentAbortController`, which is `null` at this point (the previous `runLoop` that raised the suspension already returned and cleared it in its `finally`). Synthesizes an `ExecContext` using the session, the toolCallId from the SuspensionSpec, and the new controller's `signal`. **Invokes the tool's real executor** — for `execution: 'local'` tools, calls the inner function directly; for `execution: 'rpc'` tools, sends `rpc.request { kind: 'tool.exec' }` to main and awaits the response (the rpc envelope carries `rpc.cancel` plumbing so main can propagate abort to the child process). The resolved tool_result is the real output on success, or `{error, hint?}` on failure (the wrapper's normal error path, see §6.2). **The guard check (path-guard etc.) still runs** — the resolution handler reuses the same `wrap*Tool`-style preamble to ensure the deferred execution gets the same safety checks as a regular invocation. Regardless of outcome, the `finally` block clears `session.currentResolutionAbortController = null`.
+       - **permission-deny**: resolved tool_result is `{error: 'user-denied'}`. No AbortController involvement — no tool executes.
     c. Emits a single `part-update` event at the placeholder's known `(messageId, partIndex)`, replacing `{__suspended: true, ...}` with the resolved tool_result.
     d. Deletes `suspension.json`, clears `pendingSuspension`.
 11. Worker triggers a new `runLoop` iteration. The LLM's history now contains a normal `tool_use → tool_result` pair: either the real tool output (Allow / Allow Always) or `{error: 'user-denied'}` (Deny). **No synthetic user message is appended.** The Anthropic Messages API requires exactly one `tool_result` for each `tool_use`; the rewrite IS that `tool_result`, and appending a user message would violate the pairing invariant (parent spec §15.5).
@@ -711,9 +711,12 @@ Phase 2a session in-memory state (not in meta.json):
 | `singleUseApprovals` | `Set<string>` | per runtime Session | No — consumed on hit |
 | `pendingSuspension` | `SuspensionSpec \| null` | per runtime Session | Yes, via `suspension.json` (one file per session) |
 | `currentRunPromise` | `Promise<void> \| null` | per runtime Session | No — used for single-session serialization (§13.4) |
-| `currentAbortController` | `AbortController \| null` | per runtime Session | No — used for cancel-current-turn wiring |
+| `currentAbortController` | `AbortController \| null` | per `runLoop` invocation | No — created on `runLoop` entry, cleared in `finally` (§13.4) |
+| `currentResolutionAbortController` | `AbortController \| null` | per resolution handler invocation | No — created on resolution handler entry, cleared in `finally` (§13.4) |
 
-These five fields live on the worker's `Session` class instance and are set/cleared via explicit helper methods (not direct assignment). Tests exercise these helpers, not the raw fields.
+**Invariant (enforceable at runtime with a debug assertion):** `currentAbortController` and `currentResolutionAbortController` are never both non-null at the same time. They belong to mutually-exclusive session states: a `runLoop` is either streaming (first field set, second null) or a resolution handler is executing a deferred tool (first null, second set), or the session is idle (both null). `cancel-current-turn` aborts whichever is non-null.
+
+These six fields live on the worker's `Session` class instance and are set/cleared via explicit helper methods (not direct assignment). Tests exercise these helpers, not the raw fields.
 
 ### 13.4 Single-session serialization and cancellation wiring
 
@@ -721,15 +724,26 @@ These five fields live on the worker's `Session` class instance and are set/clea
 - null → claim it, run, finally clear.
 - non-null → reject the new message with `{error: 'session-busy'}`; UI shows a toast "Chief Agent is still responding".
 
-**Cancellation.** Session holds `currentAbortController: AbortController | null`. The lifecycle:
+**Cancellation.** Session holds two AbortControllers (see §13.3 table and invariant): `currentAbortController` for the live `runLoop` and `currentResolutionAbortController` for a resolution handler that is executing a deferred tool after `permission-allow`. Only one is non-null at any time. A single `cancel-current-turn` IPC aborts whichever one is active.
 
+**Run-loop path (segment streaming):**
 1. `runLoop` entry creates a new `AbortController` and sets `session.currentAbortController = controller`.
 2. `runLoop` passes `controller.signal` as the `externalAbort` argument to every `runSegment` call within its while-loop.
-3. When main receives a `cancel-current-turn { sessionId }` IPC message, it looks up the session and forwards it to the worker. The worker handler calls `session.currentAbortController?.abort()`.
+3. On `cancel-current-turn`, the worker handler calls `session.cancelEverything()` (helper), which internally aborts both controllers if non-null. Here `currentAbortController` fires; `currentResolutionAbortController` is null.
 4. `runSegment`'s combined AbortSignal (§7.1) fires, `streamText` throws `AbortError`, `runSegment` returns `{reason: 'aborted'}`.
-5. `runLoop` sees `aborted` and returns; the `finally` block clears `session.currentAbortController = null` and `session.currentRunPromise = null`.
+5. `runLoop` sees `aborted` and returns; the `finally` block clears both `currentAbortController = null` and `currentRunPromise = null`.
 
-The controller is recreated per `runLoop` invocation — it never outlives a single user-turn's work.
+**Resolution-handler path (deferred tool execution after Allow):**
+1. The resolution handler enters. At this moment `currentAbortController` is `null` (the prior suspending `runLoop` already returned). The handler creates a new `AbortController` and sets `session.currentResolutionAbortController = controller`.
+2. Tool execution receives `controller.signal` via the synthesized `ExecContext` (§8.2 step 10b). For `rpc` tools, the signal propagates to main via the `rpc.cancel` envelope so main can kill the child process.
+3. On `cancel-current-turn`, the worker handler calls `session.cancelEverything()`, which fires `currentResolutionAbortController.abort()`. Tool execution throws `AbortError`, the wrapper maps it to `{error: 'user-cancelled', hint: 'Cancelled during resolution'}`.
+4. Resolution handler completes (catches the AbortError into the tool_result, emits the `part-update` rewrite, deletes `suspension.json`, clears `pendingSuspension`). `finally` block clears `currentResolutionAbortController = null`.
+5. Resolution handler does NOT trigger a new `runLoop` after a cancelled execution — it returns the session to idle (`currentRunPromise = null`, `currentAbortController = null`, `currentResolutionAbortController = null`). The user's next message starts a fresh `runLoop`.
+
+**Suspended-card path (no controllers live):**
+If the session is parked on a PermissionCard or AskCard and the user hits Stop before answering, `cancel-current-turn` finds both controllers null. In that case the worker handler calls a separate helper `session.cancelSuspendedCard()`: it synthesizes a `resolve-suspension` with `kind: 'permission-deny'` (for permission) or `{question-answered, answer: {__cancelled: true}}` (for question), which flows through the normal resolution path (skipping the tool-execute branch), rewrites the placeholder with a user-cancelled error, and returns the session to idle. Main receives a mirrored `permission.cancel` / `ask.cancel` message so the renderer removes the card.
+
+Both controllers are recreated per invocation — neither outlives a single user-turn's work.
 
 ## 14. Testing Strategy
 
@@ -743,16 +757,17 @@ Mock Vercel AI SDK `streamText` to return a controllable async iterator. Cover a
 4. **Permission prompt → allow → tool executes during resolution**: tool-call (e.g. `Write('/tmp/x', 'hello')`) → checkPermission returns prompt-needed → SuspensionSignal → runSegment returns suspended → resolve-suspension 'permission-allow' → **resolution handler invokes the real `Write` executor outside any `runSegment`**, file gets written → resolution handler emits `part-update` replacing placeholder with the real tool output → new runLoop iteration → next segment's history shows a normal tool_use→tool_result pair → LLM continues naturally. This is the core allow-path test; assert that the file exists, that the event log contains exactly one `part-update` for the placeholder (not two, not zero), and that no synthetic user message was appended.
 5. **Permission prompt → allow-always → tool executes during resolution → subsequent same-class tool run without prompting**: resolution is `permission-allow-always` → allowOnceClasses gains `'write'` → resolution handler invokes first `Write`, rewrites placeholder → next segment hits a second `Write` call → checkPermission sees allowlist and returns allow without prompting → second Write executes in-segment.
 6. **Suspension raised by AskUserQuestion**: control-flow tool raises `kind: 'question'` suspension → resolve-suspension 'question-answered' → resolution handler rewrites placeholder to `{resolved: true, answer: '...'}` via `part-update` → no tool execution, no synthetic user message → new runLoop iteration → LLM sees the answer in the tool_result.
-7. **External abort mid-stream**: runSegment mid-stream → externalAbort.abort() → returns aborted.
-8. **Cancel during suspension**: session is suspended (placeholder in history, `suspension.json` on disk) → `cancel-current-turn` IPC arrives before user responds → main sends `permission.cancel` to renderer (removes the card) → main sends a synthetic `resolve-suspension` with kind `permission-deny` to worker → resolution handler rewrites placeholder to `{error: 'user-cancelled'}` → session returns to idle. (Cancel-during-suspension is the ONE case where main synthesizes a resolution on the user's behalf; the error code is `'user-cancelled'` not `'user-denied'` so the LLM knows the call was interrupted, not rejected.)
-9. **Retryable error (429) succeeds on second attempt**: streamText throws 429 → retry layer backoff 200ms → second attempt returns normal finish.
-10. **Retry exhaustion**: streamText throws 429 three times in a row → retry layer gives up → returns `{reason: 'error', error: 'rate-limited'}`.
-11. **Non-retryable error (401)**: streamText throws 401 → returns error immediately without retry → error message includes sanitized "invalid API key".
-12. **Step-cap**: mock `finishReason='tool-calls'` with 50 consecutive tool-call steps → `stopWhen` fires → returns `{reason: 'step-cap'}`.
-13. **Loop continuation invariant**: finishReason='tool-calls' without actual new tool_calls in the stream (pathological SDK behavior) MUST still re-enter segment — runLoop does not special-case "empty tool_calls".
-14. **`tool-exec-status` not persisted**: assert the event log after a complete tool call contains only `message-start`, `part-append(text)`, `part-append(tool-call)`, `part-append(tool-result)`, `message-finish` — no `tool-exec-status`.
-15. **`length` finish reason**: streamText emits `finishReason='length'` → returns `{reason: 'error', error: 'context-length-exceeded'}`.
-16. **`content-filter` finish reason**: streamText emits `finishReason='content-filter'` → returns `{reason: 'error', error: 'content-filter'}`.
+7. **External abort mid-stream**: runSegment mid-stream → `session.currentAbortController.abort()` fires via `cancel-current-turn` → combined signal trips → returns aborted.
+8. **Cancel while PermissionCard is displayed (no controllers live)**: session is suspended (placeholder in history, `suspension.json` on disk), both `currentAbortController` and `currentResolutionAbortController` are null, user hits Stop before answering → worker's `cancel-current-turn` handler calls `session.cancelSuspendedCard()` → synthesizes `resolve-suspension` with `kind: 'permission-deny'` → resolution handler rewrites placeholder to `{error: 'user-cancelled', hint: 'Cancelled before answering'}` → session returns to idle. Assert no AbortController was ever created for this path. Main separately sends `permission.cancel` to the renderer to clear the card; this is not the worker's concern and should be a separate main-side unit test (see §14.1 extras below).
+9. **Cancel during resolution-handler tool execution**: `currentAbortController` is null, `currentResolutionAbortController` is mid-execute on a `Write` tool (use a fake `Write` that awaits a deferred promise so the test can pause in the middle) → `cancel-current-turn` fires → worker calls `session.cancelEverything()` → `currentResolutionAbortController.abort()` fires → the fake `Write`'s abort handler rejects → resolution handler catches AbortError, rewrites placeholder to `{error: 'user-cancelled', hint: 'Cancelled during resolution'}` → session returns to idle without triggering a new `runLoop`. Assert the `currentResolutionAbortController` field is cleared to null in the finally.
+10. **Retryable error (429) succeeds on second attempt**: streamText throws 429 → retry layer backoff 200ms → second attempt returns normal finish.
+11. **Retry exhaustion**: streamText throws 429 three times in a row → retry layer gives up → returns `{reason: 'error', error: 'rate-limited'}`.
+12. **Non-retryable error (401)**: streamText throws 401 → returns error immediately without retry → error message includes sanitized "invalid API key".
+13. **Step-cap**: mock `finishReason='tool-calls'` with 50 consecutive tool-call steps → `stopWhen` fires → returns `{reason: 'step-cap'}`.
+14. **Loop continuation invariant**: finishReason='tool-calls' without actual new tool_calls in the stream (pathological SDK behavior) MUST still re-enter segment — runLoop does not special-case "empty tool_calls".
+15. **`tool-exec-status` not persisted**: assert the event log after a complete tool call contains only `message-start`, `part-append(text)`, `part-append(tool-call)`, `part-append(tool-result)`, `message-finish` — no `tool-exec-status`.
+16. **`length` finish reason**: streamText emits `finishReason='length'` → returns `{reason: 'error', error: 'context-length-exceeded'}`.
+17. **`content-filter` finish reason**: streamText emits `finishReason='content-filter'` → returns `{reason: 'error', error: 'content-filter'}`.
 
 Additional pure-function coverage:
 
@@ -763,7 +778,7 @@ Additional pure-function coverage:
 - Retry classification: 429, 529, 401, 400, network timeout (ECONNRESET, ETIMEDOUT), abort, generic error — each classified correctly.
 - `cleanupOrphanPlaceholders`: orphan → rewrite to error; current suspension's placeholder → untouched; multiple orphans → multiple rewrites; no orphans → no writes.
 
-**Parallel tool-calls invariant (Phase 2a constraint, tested as invariant):** Phase 2a's design assumes at most one `pendingSuspension` per session. If the LLM emits two parallel tool calls in the same step and BOTH of them trigger `prompt-needed`, the second `SuspensionSignal` throw will find `session.pendingSuspension` already populated. The runSegment outer catch must detect this collision, log a hard error, end the segment with `{reason: 'error', error: 'parallel-suspension-not-supported'}`, and leave the first suspension intact on disk. Test 17: two parallel `Write` tool-calls in one segment → second raises error; first proceeds through normal resolution flow. (Parent spec §15.5's `deferredSuspensions` queue is the proper long-term fix; it is deferred to Phase 2b. In Phase 2a's eight-tool world the collision is extremely unlikely — the LLM rarely parallelizes writes — but the invariant check must exist.)
+**Parallel tool-calls invariant (Phase 2a constraint, tested as invariant):** Phase 2a's design assumes at most one `pendingSuspension` per session. If the LLM emits two parallel tool calls in the same step and BOTH of them trigger `prompt-needed`, the second `SuspensionSignal` throw will find `session.pendingSuspension` already populated. The runSegment outer catch must detect this collision, log a hard error, end the segment with `{reason: 'error', error: 'parallel-suspension-not-supported'}`, and leave the first suspension intact on disk. Test 18: two parallel `Write` tool-calls in one segment → second raises error; first proceeds through normal resolution flow. (Parent spec §15.5's `deferredSuspensions` queue is the proper long-term fix; it is deferred to Phase 2b. In Phase 2a's eight-tool world the collision is extremely unlikely — the LLM rarely parallelizes writes — but the invariant check must exist.)
 
 ### 14.2 Smoke test (opt-in, not in CI)
 
