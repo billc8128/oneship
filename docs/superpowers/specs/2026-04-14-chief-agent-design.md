@@ -417,6 +417,74 @@ export const allTools = (session: Session) => ({
 - **Permission gating**: before execution, the tool runner checks the session's permission mode. Trust mode runs immediately. Cautious mode (for `Bash / Write / Edit / CronCreate / CronDelete`) raises a `cautious` suspension before invoking `execute()`. The user's allow/deny decision arrives via `resolve-suspension` and the next segment either proceeds with the call or substitutes a `{ error: 'user-denied' }` tool-result.
 - **Plan Mode mask**: in Plan Mode, `allTools()` omits `Write / Edit / Bash / CronCreate / CronDelete / Agent` **and** restricts `Skill`. The LLM only sees the remaining tools. See §11.1 for the Skill-in-PlanMode rules; the short version is that Skill is *not* removed (so the model can still invoke read-only skills) but the sub-agent it spawns inherits Plan Mode and the same mask is applied recursively.
 
+### 6.3a Tool execution topology (Phase 2 addendum — authoritative)
+
+> Added 2026-04-15 as part of Phase 2 design. This section **supersedes** §6.2 and §6.3 wherever they conflict; the rest of §6 remains authoritative. Any future tool added to OneShip must follow these rules.
+
+This addendum codifies three architectural rules that Phase 2 introduces to keep the tool surface sane as the catalog grows past 22.
+
+**Rule 1 — Worker-default, main-exception execution**
+
+Tools execute in the worker by default. A tool only executes via Worker→Main RPC if it requires Electron APIs, UI mediation, PTY/long-lived process ownership, or other main-process-owned resources. There is no "either side works" category; every tool has a committed execution location.
+
+**Rule 2 — Every tool declares `execution` and `approvalClass`**
+
+Every tool's manifest entry MUST declare both:
+
+- `execution: 'local' | 'rpc'` — where its executor runs
+- `approvalClass: 'read' | 'write' | 'exec' | 'ui'` — what policy class it falls under
+
+There is no default and no context-dependent third mode. The manifest is the single authority for both fields; no other code path may hardcode them.
+
+**Rule 3 — Approval is orthogonal to execution location**
+
+Main is the authority for permission policy and user mediation. Worker is the authority for tool execution. The two authorities do not overlap:
+
+- A `local` tool executed in the worker can still require approval mediated by main.
+- An `rpc` tool executed in main can still be directly allowed (e.g. Bash in Trust mode) without UI mediation.
+- Path-guard, workspace-guard, and other security checks that both worker and main must enforce MUST live in a shared pure module (`src/shared/tool-guards/`) and be imported by both sides. Security logic MUST NOT be duplicated in a main-side IPC handler.
+
+**Manifest structure — two layers**
+
+Tool definitions are split into two layers:
+
+1. **Shared manifest** (`src/shared/tool-manifest.ts`): pure data — `name`, `description`, `inputSchema`, `execution`, `approvalClass`, `summarize(args)`. Imported by worker and main. No executor code.
+2. **Executor implementations**: the actual `execute(args, ctx)` function. For `execution: 'local'` tools this lives in `src/agent/tools/<name>.ts`; for `execution: 'rpc'` tools this lives in `src/main/tool-executors/<name>.ts`. Each side imports the shared manifest for its local tool set.
+
+This split prevents drift: worker and main cannot disagree on execution location or approval class because they read the same manifest entry.
+
+**Phase 2a assignment**
+
+The seven tools in Phase 2a are assigned as follows:
+
+| Tool | execution | approvalClass |
+|---|---|---|
+| Read | local | read |
+| Glob | local | read |
+| Grep | local | read |
+| WebFetch | local | read |
+| Write | local | write |
+| Edit | local | write |
+| Bash | rpc | exec |
+| AskUserQuestion | rpc | ui |
+
+Phase 2b and later additions must extend this table, not create parallel classification schemes.
+
+**Approval policy truth table**
+
+The permission mode interacts with `approvalClass` as follows:
+
+| approvalClass | trust | normal | strict |
+|---|---|---|---|
+| read | allow | allow | prompt |
+| write | allow | prompt | prompt |
+| exec | allow | prompt | prompt |
+| ui | pass-through | pass-through | pass-through |
+
+"pass-through" means the permission system returns `allow` without prompting — the tool's own executor is responsible for any UI mediation it needs (AskUserQuestion raises its own suspension, not a permission prompt).
+
+This table is evaluated by a pure function `checkPermission(mode, class, allowlist, singleUse)` that lives in the worker and queries session-local state only. See §12.2a.
+
 ### 6.4 Tool groups — quick notes
 
 Each tool gets a dedicated file, but a few are worth pre-committing architecture on:
