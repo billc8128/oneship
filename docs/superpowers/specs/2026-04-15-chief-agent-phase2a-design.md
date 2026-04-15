@@ -144,22 +144,23 @@ Phase 2a tool results are discriminated at the **top-level keys**, not wrapped i
 // The "happy" case is raw. These are the non-raw discriminators:
 type ToolResultDiscriminator =
   | { __suspended: true; suspensionId: string }           // placeholder; replaced via part-update on resolution
-  | { resolved: true; answer?: string }                   // post-resolution rewrite (ask answered, permission allowed)
-  | { error: string; hint?: string }                      // tool rejected or failed
+  | { resolved: true; answer: string }                    // question-answered resolution; answer is REQUIRED and string
+  | { error: string; hint?: string }                      // tool rejected, failed, or was cancelled
 ```
 
 Rules:
 
 - **Success** — the tool's inner `execute(args)` returns whatever the tool naturally produces (a string for `Read`, a `{stdout, stderr, exitCode}` object for `Bash`, an array for `Glob`, etc.). The wrapper in §6.2 passes this through unchanged; no envelope is added. The LLM sees the natural shape, as it would with any Claude Code tool.
-- **Error** — the wrapper catches any thrown error (or intercepts pre-execution guard rejections) and returns `{error: <code>, hint?: <detail>}`. The `error` field is a stable short code; `hint` is optional freeform context (stdout tail, file path, etc.).
+- **Error** — the wrapper catches any thrown error (or intercepts pre-execution guard rejections) and returns `{error: <code>, hint?: <detail>}`. The `error` field is a stable short code; `hint` is optional freeform context (stdout tail, file path, etc.). User cancellations also use this shape.
 - **Suspended** — the wrapper sets `{__suspended: true, suspensionId}` as the placeholder tool-result BEFORE throwing `SuspensionSignal`. This is written to the event log via `part-append`, then later replaced via `part-update` when the suspension resolves.
-- **Resolved** — used only for `question-answered` resolutions. Emits a `part-update` replacing the placeholder with `{resolved: true, answer: <string>}`. The LLM sees the answer inside the tool_result, which is protocol-correct per Anthropic's tool_use/tool_result pairing invariant. Permission-allow resolutions do NOT use this shape — they rewrite to the real tool output (see §8.2 step 7). Permission-deny rewrites to `{error: 'user-denied'}`.
+- **Resolved** — used **only** for `question-answered` resolutions where the user actually submitted an answer. Emits a `part-update` replacing the placeholder with `{resolved: true, answer: <string>}`. The `answer` field is required and is always a `string` — the user's selected choice label or freeform input. Cancellations of an AskUserQuestion do NOT use this shape; they go through the suspended-card cancel path (§13.4) and rewrite to `{error: 'user-cancelled-question'}` instead. Permission-allow resolutions do NOT use this shape either — they rewrite to the real tool output (see §8.2 step 10b). Permission-deny rewrites to `{error: 'user-denied'}`.
 
 **Disambiguation guarantee**: a tool's natural success payload MUST NOT have any top-level key named `__suspended`, `resolved`, or `error`. For Phase 2a's eight tools this is trivially true (none have such keys). A lint/test rule is added that rejects any new tool whose manifest-defined output schema includes one of these reserved keys at top level. This preserves the "success = anything not matching a discriminator" invariant without a wrapper.
 
 Error codes Phase 2a is expected to emit (non-exhaustive but all must be discriminable):
-- `'user-denied'` — permission was denied
-- `'user-cancelled-question'` — AskUserQuestion cancelled by user
+- `'user-denied'` — permission was denied via PermissionCard
+- `'user-cancelled'` — permission card was cancelled (Stop) before the user clicked Allow/Deny
+- `'user-cancelled-question'` — AskCard was cancelled (Stop or Cancel button) before the user submitted an answer
 - `'suspension-orphaned'` — cleanupOrphanPlaceholders reclaimed a stale placeholder
 - `'path-guard: <reason>'` — shared path-guard rejected the path (e.g. `'path-guard: outside workspace'`)
 - `'invalid-args: <reason>'` — zod schema validation failed
@@ -488,14 +489,16 @@ type SuspensionSpec =
   | { kind: 'plan-proposal'; suspensionId; messageId; partIndex; toolCallId; planText }
 
 type SuspensionResolution =
-  | { kind: 'question-answered'; answer: string | { __cancelled: true } }
+  | { kind: 'question-answered'; answer: string }   // user submitted; answer is REQUIRED string
   | { kind: 'permission-allow' }
   | { kind: 'permission-allow-always' }
   | { kind: 'permission-deny' }
-  | { kind: 'plan-approved' }   // Phase 2b
-  | { kind: 'plan-modified'; modifiedPlan: string }  // Phase 2b
-  | { kind: 'plan-rejected'; reason?: string }  // Phase 2b
+  | { kind: 'plan-approved' }                       // Phase 2b
+  | { kind: 'plan-modified'; modifiedPlan: string } // Phase 2b
+  | { kind: 'plan-rejected'; reason?: string }      // Phase 2b
 ```
+
+There is intentionally **no `question-cancelled` kind** in the union. AskCard cancellations don't go through `resolve-suspension` at all — they go through the `cancel-current-turn` IPC and the worker's `cancelSuspendedCard()` path (§13.4), which directly rewrites the placeholder to `{error: 'user-cancelled-question'}` without sending a fake "answer". Same for PermissionCard cancellations: they rewrite to `{error: 'user-cancelled'}`. This keeps the "user explicitly answered" path strictly separate from the "user cancelled / ran out of patience" path.
 
 Phase 2a has real handlers for the four non-`plan-*` resolution kinds. The plan-* kinds exist in the type union and are matched in the switch with a branch that throws `Phase2bNotImplemented`.
 
@@ -588,7 +591,7 @@ Actions (left to right): Deny (secondary), Allow Always (secondary, only in norm
 Title: "Chief Agent is asking".
 Severity: info.
 Body: the question text + a radio list of choices (if provided) with an "Other (specify)" fallback input. Submit validates at least one choice or non-empty text.
-Actions: Cancel (secondary, Esc shortcut), Submit (primary, Enter shortcut). Cancel sends `{ __cancelled: true }`.
+Actions: Cancel (secondary, Esc shortcut), Submit (primary, Enter shortcut). **Submit** sends `ask.respond { cardId, answer: <string> }` to main with the user's selected choice or freeform text. **Cancel** is **equivalent to clicking Stop in the chief-chat header** — it sends `cancel-current-turn { sessionId }` to main, which routes through the suspended-card cancel path in §13.4 and ends up rewriting the placeholder to `{error: 'user-cancelled-question'}`. The worker never sees a "fake answer carrying a cancellation flag" — that shape does not exist on the wire.
 
 ### 10.6 `ToolCallPill` and `ToolCallCard`
 
@@ -662,14 +665,14 @@ New message types added to `src/shared/agent-protocol.ts`:
 - `resolve-suspension { sessionId, suspensionId, resolution: SuspensionResolution, stateUpdate?: { addAllowOnceClass?: ApprovalClass } }` — the optional `stateUpdate` piggy-backs on the resolution per §8.2 step 9. Only `permission-allow-always` sends a stateUpdate; plain `permission-allow` does not, because the tool executes during resolution (§8.2 step 10b) and there's no "next call" to cache for. Worker applies the stateUpdate atomically before rewriting the placeholder.
 - `rpc.response { requestId, result: { ok, data | error } }`
 - `set-permission-mode { sessionId, mode: PermissionMode }`
-- `cancel-current-turn { sessionId }` — worker looks up `session.currentAbortController` and calls `.abort()`; see §13.4.
+- `cancel-current-turn { sessionId }` — worker dispatches to one of three paths depending on session state (§13.4): (1) if `currentAbortController` is non-null, abort the live `runLoop`; (2) else if `currentResolutionAbortController` is non-null, abort the in-flight resolution-handler tool execution; (3) else the session is parked on a card — call `session.cancelSuspendedCard()` which synthesizes a resolution that rewrites the placeholder to `{error: 'user-cancelled'}` (for permission) or `{error: 'user-cancelled-question'}` (for question) and clears `pendingSuspension`. Exactly one branch fires; the three states are mutually exclusive per the §13.3 invariant.
 
 **Main → Renderer**
 - `chief:event { ...LogEvent | tool-exec-status | permission.prompt | ask.prompt | permission.cancel | ask.cancel }`
 
 **Renderer → Main**
 - `permission.respond { cardId, action: 'allow' | 'allow-always' | 'deny' }`
-- `ask.respond { cardId, answer: string | { __cancelled: true } }`
+- `ask.respond { cardId, answer: string }` — the user's answer (selected choice label or freeform text). If the user cancels the AskCard via the Cancel button, the renderer sends `cancel-current-turn` instead, and the worker handles it via the suspended-card path above. There is no "answer is cancellation" shape on the wire.
 - `cancel-current-turn { sessionId }`
 - `set-permission-mode { sessionId, mode }`
 
@@ -741,7 +744,13 @@ These six fields live on the worker's `Session` class instance and are set/clear
 5. Resolution handler does NOT trigger a new `runLoop` after a cancelled execution — it returns the session to idle (`currentRunPromise = null`, `currentAbortController = null`, `currentResolutionAbortController = null`). The user's next message starts a fresh `runLoop`.
 
 **Suspended-card path (no controllers live):**
-If the session is parked on a PermissionCard or AskCard and the user hits Stop before answering, `cancel-current-turn` finds both controllers null. In that case the worker handler calls a separate helper `session.cancelSuspendedCard()`: it synthesizes a `resolve-suspension` with `kind: 'permission-deny'` (for permission) or `{question-answered, answer: {__cancelled: true}}` (for question), which flows through the normal resolution path (skipping the tool-execute branch), rewrites the placeholder with a user-cancelled error, and returns the session to idle. Main receives a mirrored `permission.cancel` / `ask.cancel` message so the renderer removes the card.
+If the session is parked on a PermissionCard or AskCard and the user hits Stop (or, for AskCard, clicks the Cancel button which is wired to the same path), `cancel-current-turn` finds both AbortControllers null. In that case the worker handler calls `session.cancelSuspendedCard()`. The helper does NOT flow through the normal `resolve-suspension` IPC at all — it directly invokes the resolution-handler write path with a hardcoded outcome:
+
+- `pendingSuspension.kind === 'permission'` → rewrite placeholder to `{error: 'user-cancelled', hint: 'Cancelled before answering'}`
+- `pendingSuspension.kind === 'question'` → rewrite placeholder to `{error: 'user-cancelled-question', hint: 'Cancelled before answering'}`
+- `pendingSuspension.kind === 'plan-proposal'` → Phase 2b; throws `Phase2bNotImplemented`
+
+After the rewrite, the helper deletes `suspension.json`, clears `pendingSuspension`, and returns the session to idle without triggering a new `runLoop`. Main receives a mirrored `permission.cancel` / `ask.cancel` message so the renderer removes the card. Note that this path uses neither `currentAbortController` nor `currentResolutionAbortController` — there's nothing to abort, just a synchronous state-rewrite to do.
 
 Both controllers are recreated per invocation — neither outlives a single user-turn's work.
 
@@ -758,7 +767,7 @@ Mock Vercel AI SDK `streamText` to return a controllable async iterator. Cover a
 5. **Permission prompt → allow-always → tool executes during resolution → subsequent same-class tool run without prompting**: resolution is `permission-allow-always` → allowOnceClasses gains `'write'` → resolution handler invokes first `Write`, rewrites placeholder → next segment hits a second `Write` call → checkPermission sees allowlist and returns allow without prompting → second Write executes in-segment.
 6. **Suspension raised by AskUserQuestion**: control-flow tool raises `kind: 'question'` suspension → resolve-suspension 'question-answered' → resolution handler rewrites placeholder to `{resolved: true, answer: '...'}` via `part-update` → no tool execution, no synthetic user message → new runLoop iteration → LLM sees the answer in the tool_result.
 7. **External abort mid-stream**: runSegment mid-stream → `session.currentAbortController.abort()` fires via `cancel-current-turn` → combined signal trips → returns aborted.
-8. **Cancel while PermissionCard is displayed (no controllers live)**: session is suspended (placeholder in history, `suspension.json` on disk), both `currentAbortController` and `currentResolutionAbortController` are null, user hits Stop before answering → worker's `cancel-current-turn` handler calls `session.cancelSuspendedCard()` → synthesizes `resolve-suspension` with `kind: 'permission-deny'` → resolution handler rewrites placeholder to `{error: 'user-cancelled', hint: 'Cancelled before answering'}` → session returns to idle. Assert no AbortController was ever created for this path. Main separately sends `permission.cancel` to the renderer to clear the card; this is not the worker's concern and should be a separate main-side unit test (see §14.1 extras below).
+8. **Cancel while PermissionCard is displayed (no controllers live)**: session is suspended (placeholder in history, `suspension.json` on disk, `pendingSuspension.kind === 'permission'`), both `currentAbortController` and `currentResolutionAbortController` are null, user hits Stop before answering → worker's `cancel-current-turn` handler calls `session.cancelSuspendedCard()` → helper rewrites placeholder directly to `{error: 'user-cancelled', hint: 'Cancelled before answering'}` via `part-update`, deletes `suspension.json`, clears `pendingSuspension`, returns session to idle. Assert no AbortController was created and no `resolve-suspension` IPC was synthesized — `cancelSuspendedCard()` is a synchronous local rewrite path. (Main separately sends `permission.cancel` to the renderer to clear the card; that's a main-side concern.) Add a parallel test 8b for `pendingSuspension.kind === 'question'` → rewrites to `{error: 'user-cancelled-question'}`.
 9. **Cancel during resolution-handler tool execution**: `currentAbortController` is null, `currentResolutionAbortController` is mid-execute on a `Write` tool (use a fake `Write` that awaits a deferred promise so the test can pause in the middle) → `cancel-current-turn` fires → worker calls `session.cancelEverything()` → `currentResolutionAbortController.abort()` fires → the fake `Write`'s abort handler rejects → resolution handler catches AbortError, rewrites placeholder to `{error: 'user-cancelled', hint: 'Cancelled during resolution'}` → session returns to idle without triggering a new `runLoop`. Assert the `currentResolutionAbortController` field is cleared to null in the finally.
 10. **Retryable error (429) succeeds on second attempt**: streamText throws 429 → retry layer backoff 200ms → second attempt returns normal finish.
 11. **Retry exhaustion**: streamText throws 429 three times in a row → retry layer gives up → returns `{reason: 'error', error: 'rate-limited'}`.

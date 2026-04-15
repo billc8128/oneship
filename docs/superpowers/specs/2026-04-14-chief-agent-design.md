@@ -155,7 +155,7 @@ type ToWorker =
         | { kind: 'plan-approved', injectedMessage: string }
         | { kind: 'plan-modified', modifiedPlan: string }
         | { kind: 'plan-rejected', reason: string }
-        | { kind: 'question-answered', answer: string | { choice: string } }
+        | { kind: 'question-answered', answer: string }   // string only; cancellations go through cancel-current-turn, not this kind
         | { kind: 'permission-allow' }
         | { kind: 'permission-allow-always' }
         | { kind: 'permission-deny' },
@@ -1441,7 +1441,7 @@ The active suspension's placeholder *is* preserved through this sweep because th
 
 - **Crash during a suspension** (before resolve-suspension arrives): `suspension.json` survives the crash. On restart, the session loads, sees the suspension, re-emits `suspension-raised`, the UI rebuilds the card. The user resolves it as if nothing happened.
 - **Crash mid-resolution**: handled by the resolution write protocol above. Idempotent re-resolution.
-- **User cancels mid-suspension**: `cancel-current-turn` runs the rewrite path with a `{ error: 'user-cancelled', hint: 'User cancelled the pending action.' }` payload, deletes suspension.json, sets `lastSegmentReason='aborted'`, and the session goes idle. No new segment is started. The chat shows a small system notice "Cancelled. Send a new message to continue."
+- **User cancels mid-suspension**: `cancel-current-turn` is dispatched by the worker into one of three paths depending on session state (Phase 2a §13.4 has the canonical description). For the suspended-card case (no AbortControllers live), the worker calls `session.cancelSuspendedCard()`, which directly rewrites the placeholder via `part-update` to either `{ error: 'user-cancelled', hint: 'Cancelled before answering' }` (for permission suspensions) or `{ error: 'user-cancelled-question', hint: 'Cancelled before answering' }` (for question suspensions). suspension.json is deleted, `pendingSuspension` is cleared, `lastSegmentReason='aborted'`, the session goes idle. No new segment is started. The chat shows a small system notice "Cancelled. Send a new message to continue."
 - **Parallel tool calls in one step that all suspend**: this *is* possible. Vercel AI SDK executes all tool calls from one step in parallel by default. If the model emits, say, two permission-gated Bash calls, both dispatcher wrappers will run their permission check and try to push to `pendingSuspension`. The session uses a **first-wins queue**:
 
     ```ts
