@@ -524,7 +524,7 @@ On session open, if `suspension.json` exists, the session is in the "suspended" 
 
 ### 10.1 Chief-chat refactor
 
-`src/renderer/src/components/chief-chat/chief-chat.tsx`: original Phase 1 code is rewritten in place to:
+`src/renderer/pages/chief-chat.tsx` (existing file from Phase 1): original code is rewritten in place to:
 
 - Remove all dependence on the `appendAssistantStubReply` path.
 - Subscribe to `chief:event` IPC for both persistent events (message-start/part-append/part-update/message-finish) and renderer-only events (tool-exec-status).
@@ -533,20 +533,21 @@ On session open, if `suspension.json` exists, the session is in the "suspended" 
 
 ### 10.2 New components
 
+The Phase 2a renderer additions follow the existing flat-file convention (`src/renderer/components/chat/messages/*.tsx`, etc.) — no new subdirectories. Files added:
+
 ```
-src/renderer/src/components/chief-chat/
-  message.tsx
-  parts/
-    text-part.tsx
-    tool-call-pill.tsx
-    tool-call-card.tsx
-  cards/
-    suspension-card-shell.tsx
-    permission-card.tsx
-    ask-card.tsx
-  preferences/
-    chief-agent-panel.tsx
+src/renderer/components/chat/messages/
+  text-part.tsx          # NEW — streaming text part renderer
+  tool-call-pill.tsx     # NEW — compact tool-call display
+  tool-call-card.tsx     # NEW — expanded tool-call card with args + result
+  suspension-card-shell.tsx  # NEW — shared shell for permission/ask/plan cards
+  permission-card.tsx    # NEW — permission prompt card body
+  ask-card.tsx           # NEW — AskUserQuestion card body
 ```
+
+Preferences UI is added in-place to the existing `src/renderer/pages/preferences-page.tsx` file by inserting a new "Chief Agent" section alongside the existing settings sections — Phase 2a does NOT create a separate Preferences file.
+
+`src/renderer/pages/chief-chat.tsx` (existing) is rewritten in place to import the new message-part components and to subscribe to the expanded `chief:event` stream (tool-exec-status renderer-only events).
 
 ### 10.3 `SuspensionCardShell` contract
 
@@ -607,7 +608,9 @@ Props: `text: string`, `isStreaming: boolean`. Renders text with a trailing blin
 
 ### 10.8 Preferences panel
 
-New `chief-agent-panel.tsx` in the Preferences layout:
+A new "Chief Agent" section is added **in-place** to the existing `src/renderer/pages/preferences-page.tsx` file. No new Preferences file is created — Phase 2a follows the existing convention of one big Preferences page with multiple sections.
+
+The new section contains:
 
 - OpenRouter API Key: password input + Save button. Validates format (starts with `sk-or-`). On save, writes to secret-store.
 - Model selector: dropdown populated from cached OpenRouter models list (`~/.oneship{,-dev}/cache/openrouter-models.json`, TTL 24h). Refresh button calls `/api/v1/models` and updates cache. Default selection: `anthropic/claude-sonnet-4.6`.
@@ -636,9 +639,13 @@ Subscribes to `suspension-raised` messages from worker. Dispatches by `spec.kind
 
 ### 11.4 `tool-executors/bash.ts`
 
-Calls into `TerminalManager` for one-shot command execution. Plan task should verify what API TerminalManager currently exposes — if it only has PTY-based interactive sessions, a thin wrapper for one-shot exec (child_process.spawn with the same env as the project shell) is added to TerminalManager.
+Resolved during planning: `src/main/terminal-manager.ts` exposes only PTY-based interactive sessions (`create / write / kill / killAll`). It has **no** one-shot exec API and Phase 2a does NOT extend it. Instead, `tool-executors/bash.ts` directly uses Node's `child_process.spawn` to run the command as a one-shot process with `{ cwd, env, shell: false }`, captures stdout/stderr into a string buffer (capped at 1 MB each — see §11.4 truncation rule below), and returns `{ stdout, stderr, exitCode }` when the child exits.
 
-Abort: the executor listens for `rpc.cancel` messages and kills the child process group.
+Why not extend TerminalManager: TerminalManager owns long-lived PTY sessions tied to the chat UI and hook bridge. Adding a one-shot path would entangle two unrelated lifecycles (one-shot command for an agent vs. interactive shell for a human), and forking a separate executor avoids any chance of accidentally pumping agent stdout through the human terminal pipe. Phase 2b's `BashOutput` and `Monitor` will need a session-scoped `Map<shellId, RunningShell>` for `run_in_background` mode — that map will live in `tool-executors/bash.ts` (or a sibling), still distinct from TerminalManager.
+
+**Truncation**: each of stdout and stderr is capped at 1 MB. If exceeded, the buffer keeps the first 256 KB and last 256 KB joined with `\n…[truncated N bytes]…\n` and the result includes a `truncated: true` field. Plan task implements this.
+
+**Abort**: the executor receives the `AbortSignal` from the synthesized `ExecContext` (worker-side wrapper) or via the `rpc.cancel` envelope (after worker→main rpc dispatch). On abort, it sends `SIGTERM` to the child process group, waits 200 ms for graceful exit, then `SIGKILL` if still alive. The resolved tool_result on abort is `{ error: 'user-cancelled', hint: 'Cancelled mid-execution' }`.
 
 ### 11.5 Main-side role for AskUserQuestion
 
@@ -860,19 +867,16 @@ src/main/
     suspension-router.test.ts
     bash-executor.test.ts
 
-src/renderer/src/components/chief-chat/
-  message.tsx
-  parts/
-    text-part.tsx
-    tool-call-pill.tsx
-    tool-call-card.tsx
-  cards/
-    suspension-card-shell.tsx
-    permission-card.tsx
-    ask-card.tsx
-  preferences/
-    chief-agent-panel.tsx
+src/renderer/components/chat/messages/
+  text-part.tsx
+  tool-call-pill.tsx
+  tool-call-card.tsx
+  suspension-card-shell.tsx
+  permission-card.tsx
+  ask-card.tsx
 ```
+
+(No new directory under `src/renderer/`. Files sit alongside the existing `assistant-text.tsx`, `system-notice.tsx`, `user-bubble.tsx` per Phase 1's flat convention.)
 
 ### 15.2 Modified files
 
@@ -885,10 +889,13 @@ src/agent/ipc/rpc-client.ts           # fill in rpcCall
 src/agent/session/session.ts          # + allowOnceClasses / singleUseApprovals / pendingSuspension; DELETE appendAssistantStubReply
 src/agent/services/event-log.ts       # no schema change; verify no regression with the new usage patterns
 src/agent/services/conversation-store.ts  # DELETE (if not referenced) or strip Phase1NotImplemented
-src/main/agent-host.ts                # + rpc handling, resolve-suspension, set-permission-mode
-src/main/index.ts                     # register suspension-router, permission-reconciler, tool-executors; Preferences menu
-src/shared/agent-protocol.ts          # + SuspensionSpec/Resolution/RpcRequest/etc.
-src/renderer/src/components/chief-chat/chief-chat.tsx  # rewrite in place
+src/main/agent-host.ts                # + rpc handling, resolve-suspension, set-permission-mode, cancel-current-turn three-path dispatch
+src/main/index.ts                     # register suspension-router, tool-executors registry, chief.* IPC additions
+src/shared/agent-protocol.ts          # + SuspensionSpec/Resolution/RpcRequest/PermissionMode widening/SegmentFinishReason 'tool-calls' addition
+src/renderer/pages/chief-chat.tsx     # rewrite to use new message-part components + tool-exec-status live updates
+src/renderer/pages/preferences-page.tsx  # add Chief Agent section in-place (API key + model selector + default permission mode)
+src/renderer/stores/chief-session.ts  # extend to handle new chief:event types (suspension-raised, tool-exec-status, permission/ask prompt+cancel)
+src/preload/index.ts                  # if new IPC channels need preload exposure
 ```
 
 ### 15.3 Deletions
@@ -907,13 +914,13 @@ Acceptance: `grep -rn "Phase1NotImplemented\|appendAssistantStubReply" src/` ret
 
 1. **Vercel AI SDK v6 `experimental_context` behavior in mocks.** Our tool executors rely on `ctx.experimental_context.session` being the real Session instance. If our mock of `streamText` passes this differently from the real SDK, unit tests pass but production fails. Mitigation: the smoke test in §14.2 validates that real SDK invocation still wires context through.
 2. **OpenRouter tool-call quirks with Anthropic models.** OpenRouter proxies to provider APIs, and Anthropic's tool-calling format has some headers (e.g. prompt caching) that behave differently via OpenRouter than via direct Anthropic API. Phase 2a does NOT test cache-control behavior; §7.1 static prompt caching may silently not cache through OpenRouter. Mitigation: accept the uncached cost for Phase 2a; Phase 2b verifies cache hits via `x-openrouter-cost` headers.
-3. **Bash abort propagation to child process.** `TerminalManager` may not currently expose a "kill just this child" API; if not, the plan must add one. Validation task in the plan.
+3. **Bash abort propagation to child process.** Resolved: `tool-executors/bash.ts` uses `child_process.spawn` directly (not TerminalManager) and abort sends SIGTERM → 200ms wait → SIGKILL on the process group. See §11.4.
+
 ## 17. Open Questions (must be resolved during plan writing)
 
-1. Does `TerminalManager` already have a one-shot exec API? (§11.4 decision)
-2. Is `/tmp` the right "allowed outside workspace" path, or should it be more restrictive? (§6.4 decision)
-3. Should the Preferences panel require an API key before enabling Chief Agent at all, or allow a read-only "no key configured" state? (UX decision)
-4. Plan resolutions DO append synthetic user messages (§12.3 in parent spec). Phase 2a doesn't implement plan mode but its IPC protocol union includes the plan resolution kinds. The plan task should verify the SuspensionResolution union shape matches the parent spec's §15.5 step 5 and that the plan-specific branches throw `Phase2bNotImplemented` cleanly.
+1. Is `/tmp` the right "allowed outside workspace" path, or should it be more restrictive? (§6.4 decision)
+2. Should the Preferences panel require an API key before enabling Chief Agent at all, or allow a read-only "no key configured" state? (UX decision)
+3. Plan resolutions DO append synthetic user messages (§12.3 in parent spec). Phase 2a doesn't implement plan mode but its IPC protocol union includes the plan resolution kinds. The plan task should verify the SuspensionResolution union shape matches the parent spec's §15.5 step 5 and that the plan-specific branches throw `Phase2bNotImplemented` cleanly.
 
 ## 18. References
 
