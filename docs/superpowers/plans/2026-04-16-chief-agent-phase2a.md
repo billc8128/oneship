@@ -914,6 +914,10 @@ Add the method:
  * BOTH allowOnceClasses and singleUseApprovals — the old allowlist was
  * consented under the old mode and is no longer applicable.
  */
+async persistMeta(): Promise<void> {
+  await writeMeta(this.meta)
+}
+
 async setPermissionMode(mode: PermissionMode): Promise<void> {
   this.meta.permissionMode = mode
   this.allowOnceClasses.clear()
@@ -922,16 +926,7 @@ async setPermissionMode(mode: PermissionMode): Promise<void> {
 }
 ```
 
-If `persistMeta` does not yet exist on Session, look for the existing meta-write helper (likely `writeMeta(this.meta)` from `./store`). Use that directly instead of a new `persistMeta` method:
-
-```ts
-async setPermissionMode(mode: PermissionMode): Promise<void> {
-  this.meta.permissionMode = mode
-  this.allowOnceClasses.clear()
-  this.singleUseApprovals.clear()
-  await writeMeta(this.meta)
-}
-```
+Phase 1 has no `persistMeta` method on Session — it uses the free function `writeMeta(this.meta)` from `./store` at every call site. Task 6 adds `persistMeta` once as a thin instance method so subsequent tasks (Task 10, 13) can call it without re-importing `writeMeta`. Make sure to import `writeMeta` from `./store` if not already imported.
 
 - [ ] **Step 5: Run tests**
 
@@ -1929,7 +1924,7 @@ Actually, **leave `Phase1NotImplemented` in place** for Task 16 to delete in one
 
 - [ ] **Step 3: Add the full set of Phase 2a Session write helpers**
 
-Edit `src/agent/session/session.ts`. Add **all six** new methods that Phase 2a needs (Task 11b will call `appendTextPart`, Task 13's `runSegment` will call all of them — defining them here keeps the Session API atomic).
+Edit `src/agent/session/session.ts`. Add **all seven** new methods that Phase 2a needs (Task 11b will call `appendTextPart`, Task 13's `runSegment` will call all of them — defining them here keeps the Session API atomic).
 
 ```ts
 async beginAssistantMessage(): Promise<string> {
@@ -3198,7 +3193,7 @@ export async function runLoop(
 }
 ```
 
-If `session.persistMeta()` doesn't exist, add it as a thin wrapper for the existing `writeMeta(this.meta)` call.
+`session.persistMeta()` is defined in Task 6 (alongside `setPermissionMode`). Use it directly.
 
 - [ ] **Step 5: Re-export from loop.ts**
 
@@ -3348,6 +3343,8 @@ git commit -m "feat(runtime): runSegment + runLoop + system-prompt + Session hel
 
 Task 13 wrote 5 tests (1, 13, 14, 16, 17). This task adds the remaining 13 + the parallel-suspension invariant (test 18). Each test extends the existing file with mock-streamText harness already established in Task 13.
 
+**Critical setup detail**: tests 3, 4, 5, 9, and 18 all expect a Write tool call to **suspend** (not execute immediately). `Session.create()` defaults `permissionMode` to whatever Phase 1 hardcodes (`'trust'` historically, but Task 6 widens it). In trust mode `checkPermission` returns `'allow'` for write-class tools, so the wrapper runs the inner Write executor immediately and **no SuspensionSignal fires**. Every suspending-flow test in this file MUST call `await session.setPermissionMode('normal')` after `Session.create` and before the first `runSegment` call. Tests 6 (AskUserQuestion) and 10/11/12 (retry/error) don't need this because `ui` class is pass-through in all modes and retry tests don't involve permission. The plan adds the `setPermissionMode` call inline in each affected test.
+
 - [ ] **Step 0: Add the parallel-suspension collision check to runSegment**
 
 Edit `src/agent/runtime/run-segment.ts`. Find the existing `catch (err)` block and update the `if (err instanceof SuspensionSignal)` branch:
@@ -3412,6 +3409,7 @@ This test exercises the wrapper's prompt-needed path through suspension into res
 ```ts
 it('test 3: permission prompt → deny end-to-end', async () => {
   const session = await Session.create({ sessionId: 's_t3' })
+  await session.setPermissionMode('normal')   // required for write to suspend
   await session.appendUserMessage('write something')
   // Use a real Write wrapper so the suspension actually fires.
   const stream = makeStreamMock([
@@ -3442,6 +3440,7 @@ it('test 3: permission prompt → deny end-to-end', async () => {
 ```ts
 it('test 4: permission prompt → allow → tool executes during resolution', async () => {
   const session = await Session.create({ sessionId: 's_t4' })
+  await session.setPermissionMode('normal')   // required for write to suspend
   await session.appendUserMessage('write the file')
   const stream = makeStreamMock([
     { type: 'tool-call', toolCallId: 'tc_w', toolName: 'Write', input: { file_path: '/tmp/oneship-t4.txt', content: 'phase2a' } },
@@ -3473,6 +3472,7 @@ it('test 4: permission prompt → allow → tool executes during resolution', as
 ```ts
 it('test 5: allow-always seeds allowOnceClasses', async () => {
   const session = await Session.create({ sessionId: 's_t5' })
+  await session.setPermissionMode('normal')   // required for write to suspend
   await session.appendUserMessage('write twice')
   const stream = makeStreamMock([
     { type: 'tool-call', toolCallId: 'tc_w1', toolName: 'Write', input: { file_path: '/tmp/oneship-t5a.txt', content: 'a' } },
@@ -3555,6 +3555,7 @@ This needs a fake `Write` tool that hangs on a deferred promise so the test can 
 ```ts
 it('test 9: cancel during resolution-handler execution', async () => {
   const session = await Session.create({ sessionId: 's_t9' })
+  await session.setPermissionMode('normal')   // required for write to suspend
   await session.appendUserMessage('write')
 
   // Suspend via runSegment as in test 4.
@@ -3670,23 +3671,57 @@ it('test 15: tool-exec-status is not persisted', async () => {
 The `runSegment` collision check is implemented in **Step 0** above (already updated `src/agent/runtime/run-segment.ts`). This step only writes the test that exercises it.
 
 ```ts
-it('test 18: two parallel suspending tool calls → second raises parallel-suspension-not-supported error', async () => {
+it('test 18: SuspensionSignal arriving when pendingSuspension is already set → parallel-suspension-not-supported error', async () => {
+  // Note on test design: simulating "two parallel tool calls suspend in the
+  // same step" via streamText mock is brittle — when the AI SDK calls
+  // tool.execute() and the first throws SuspensionSignal, the for-await loop
+  // exits and the second tool-call yield never reaches runSegment. So we
+  // can't reproduce parallel suspension via the public SDK path in a unit
+  // test. Instead, we directly exercise the invariant: pre-populate
+  // session.pendingSuspension (simulating the first tool already winning),
+  // then mock streamText to throw a SuspensionSignal with a DIFFERENT
+  // suspensionId. runSegment's catch block must detect the mismatch and
+  // return parallel-suspension-not-supported.
+  //
+  // This tests the Step 0 invariant code precisely. The "two real tool
+  // calls" scenario is not reachable through Phase 2a's mock harness; the
+  // genuine end-to-end coverage waits for Phase 2b's deferredSuspensions
+  // queue.
+  const { SuspensionSignal } = await import('../../tools/suspension-signal')
   const session = await Session.create({ sessionId: 's_t18' })
+  await session.setPermissionMode('normal')
   await session.appendUserMessage('write two files')
-  // Mock streamText to emit two tool-calls in the same step; the wrapper
-  // for the first sets pendingSuspension, the second tries to as well.
-  const stream = makeStreamMock([
-    { type: 'tool-call', toolCallId: 'tc_a', toolName: 'Write', input: { file_path: '/tmp/oneship-t18a.txt', content: 'a' } },
-    { type: 'tool-call', toolCallId: 'tc_b', toolName: 'Write', input: { file_path: '/tmp/oneship-t18b.txt', content: 'b' } },
-  ], 'tool-calls')
+
+  // Pre-populate pendingSuspension (the "first tool already won" state).
+  session.pendingSuspension = {
+    kind: 'permission',
+    suspensionId: 'sus_first',
+    messageId: 'msg_pre',
+    partIndex: 0,
+    toolCallId: 'tc_a',
+    toolName: 'Write',
+    approvalClass: 'write',
+    summary: 'Write a',
+    args: { file_path: '/tmp/a', content: 'a' },
+  }
+
+  // Mock streamText so that consuming fullStream throws a SuspensionSignal
+  // with a DIFFERENT id than the pre-populated one.
+  const stream = vi.fn().mockReturnValue({
+    fullStream: (async function* () {
+      throw new SuspensionSignal('sus_second')
+    })(),
+  })
+
   const result = await runSegment(session, new AbortController().signal, { streamText: stream as any, getModel: fakeGetModel })
-  // Step 0's collision check detects the second SuspensionSignal and
-  // ends with a clear error code. The first suspension's pendingSuspension
-  // is left intact on disk so the user can still resolve it.
+
+  // Step 0's collision check detects the mismatch and ends with a clear
+  // error code. The first pendingSuspension is left intact on disk so the
+  // user can still resolve it via the normal path.
   expect(result.reason).toBe('error')
   expect(result.error).toBe('parallel-suspension-not-supported')
   expect(session.pendingSuspension).not.toBeNull()
-  expect(session.pendingSuspension?.toolCallId).toBe('tc_a')   // first wins
+  expect(session.pendingSuspension?.suspensionId).toBe('sus_first')
 })
 ```
 
@@ -4086,9 +4121,10 @@ Edit `src/agent/ipc/server.ts`. Replace the `case 'cancel-current-turn'` block w
 ```ts
 import { cancelSuspendedCard } from '../session/resolution-handler'
 
-// ... inside the handler switch ...
+// ... inside handleMessage(channel, sessions, msg) — note the parameter
+// is named `sessions`, not `sessionManager` ...
 case 'cancel-current-turn': {
-  const session = sessionManager.get(msg.sessionId)
+  const session = sessions.get(msg.sessionId)
   if (!session) {
     channel.postMessage({
       type: 'segment-finished',
