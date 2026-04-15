@@ -12,8 +12,8 @@ describe('global renderer styles', () => {
     expect(globalsCss).toContain('scrollbar-gutter: stable;')
   })
 
-  it('maps the xterm viewport gutter to the terminal theme background', () => {
+  it('overrides xterm viewport black fill so the scrollbar gutter matches the active terminal background', () => {
     expect(globalsCss).toContain('.xterm .xterm-viewport {')
-    expect(globalsCss).toContain('background-color: var(--terminal-viewport-background, #000);')
+    expect(globalsCss).toContain('background-color: transparent;')
   })
 })

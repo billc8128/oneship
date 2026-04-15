@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import '@xterm/xterm/css/xterm.css'
 import {
   attachTerminalView,
   detachTerminalView,

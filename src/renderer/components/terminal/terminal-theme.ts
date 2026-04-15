@@ -67,6 +67,5 @@ export function getTerminalInactiveTabStyle(theme: ResolvedTerminalTheme): CSSPr
 export function getTerminalPanelStyle(theme: ResolvedTerminalTheme): CSSProperties {
   return {
     backgroundColor: theme.chrome.terminalBackground,
-    '--terminal-viewport-background': theme.xterm.background,
   }
 }
