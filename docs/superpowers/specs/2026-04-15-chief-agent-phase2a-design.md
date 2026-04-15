@@ -135,15 +135,24 @@ Worker imports `TOOL_MANIFESTS` to build its `allTools()` registry (filtering by
 
 ### 6.1a Normative `ToolResult` shape
 
-Every tool in Phase 2a returns a value that can be discriminated into exactly one of the following shapes, which `replay()`, the UI, and the LLM must all handle consistently:
+Phase 2a tool results are discriminated at the **top-level keys**, not wrapped in a success tag. A successful tool returns its raw payload; only non-success cases carry a discriminator. This matches cc-src's and Vercel AI SDK's convention — the LLM sees raw tool output in the success case, not a `{ok: true, data: ...}` envelope.
 
 ```ts
-type ToolResult =
+// The "happy" case is raw. These are the non-raw discriminators:
+type ToolResultDiscriminator =
   | { __suspended: true; suspensionId: string }           // placeholder; replaced via part-update on resolution
-  | { resolved: true; answer?: string }                   // happy-path resolution (ask answered, permission allowed)
-  | { ok: true; data: unknown }                           // tool executed successfully; data is the tool-specific payload
-  | { error: string; hint?: string }                      // tool rejected or failed; error is a stable code or short message
+  | { resolved: true; answer?: string }                   // post-resolution rewrite (ask answered, permission allowed)
+  | { error: string; hint?: string }                      // tool rejected or failed
 ```
+
+Rules:
+
+- **Success** — the tool's inner `execute(args)` returns whatever the tool naturally produces (a string for `Read`, a `{stdout, stderr, exitCode}` object for `Bash`, an array for `Glob`, etc.). The wrapper in §6.2 passes this through unchanged; no envelope is added. The LLM sees the natural shape, as it would with any Claude Code tool.
+- **Error** — the wrapper catches any thrown error (or intercepts pre-execution guard rejections) and returns `{error: <code>, hint?: <detail>}`. The `error` field is a stable short code; `hint` is optional freeform context (stdout tail, file path, etc.).
+- **Suspended** — the wrapper sets `{__suspended: true, suspensionId}` as the placeholder tool-result BEFORE throwing `SuspensionSignal`. This is written to the event log via `part-append`, then later replaced via `part-update` when the suspension resolves.
+- **Resolved** — when the explicit §8.2 step 12 rewrite runs, it emits a `part-update` replacing the placeholder with `{resolved: true, answer?: <string>}`. This is the post-resolution marker the LLM sees for a question or permission-allow. (For permission-allow the LLM doesn't actually need the `resolved` marker because the subsequent synthetic user message tells it to re-emit; but the marker is harmless and makes the event log self-describing.)
+
+**Disambiguation guarantee**: a tool's natural success payload MUST NOT have any top-level key named `__suspended`, `resolved`, or `error`. For Phase 2a's seven tools this is trivially true (none have such keys). A lint/test rule is added that rejects any new tool whose manifest-defined output schema includes one of these reserved keys at top level. This preserves the "success = anything not matching a discriminator" invariant without a wrapper.
 
 Error codes Phase 2a is expected to emit (non-exhaustive but all must be discriminable):
 - `'user-denied'` — permission was denied
@@ -152,9 +161,9 @@ Error codes Phase 2a is expected to emit (non-exhaustive but all must be discrim
 - `'path-guard: <reason>'` — shared path-guard rejected the path (e.g. `'path-guard: outside workspace'`)
 - `'invalid-args: <reason>'` — zod schema validation failed
 - `'exec-failed: <reason>'` — Bash or similar tool exited with non-zero (hint carries stdout/stderr tail)
-- any tool-specific runtime error, sanitized by sanitize-error.ts
+- any tool-specific runtime error, sanitized by sanitize-error.ts before the `error` field is filled in
 
-Tools never return raw objects without a discriminator. The wrapper in §6.2 wraps every successful inner execution into `{ok: true, data: <raw>}` and every thrown error into `{error: ...}`. This keeps the UI renderer and the LLM's view of tool output uniform.
+UI renderers and replay code can always distinguish the four states with a single top-key probe: check `__suspended`, then `resolved`, then `error`, otherwise treat as raw success value (tool-specific shape).
 
 ### 6.2 Worker tool wrapper
 
@@ -171,14 +180,24 @@ export function wrapLocalTool(
     execute: async (args, ctx) => {
       const session = ctx.experimental_context.session as Session
       const decision = checkPermission(session, manifest.approvalClass, manifest.name, args)
+
       if (decision === 'allow') {
-        guardArgs(manifest, args)  // shared tool-guards
-        return await inner(args, ctx)
+        try {
+          guardArgs(manifest, args)  // shared tool-guards; may throw PathGuardError
+          return await inner(args, ctx)  // raw tool-specific payload — §6.1a success case
+        } catch (err) {
+          if (err instanceof PathGuardError) {
+            return { error: `path-guard: ${err.reason}` }
+          }
+          return { error: sanitizeErrorCode(err), hint: sanitizeErrorHint(err) }
+        }
       }
+
       if (decision === 'deny') {
         return { error: 'user-denied' }
       }
-      // prompt-needed
+
+      // decision === 'prompt-needed' — raise a permission suspension
       const suspensionId = nanoid()
       session.pendingSuspension = {
         kind: 'permission',
@@ -202,9 +221,15 @@ export function wrapLocalTool(
 }
 
 export function wrapRpcTool(manifest: ToolManifest): Tool {
-  // Same permission-check prelude as local; on allow, send rpc.request and await.
+  // Same permission-check prelude as wrapLocalTool. On allow: send
+  // rpc.request { kind: 'tool.exec' } and await response. On success the
+  // response payload is returned raw. On error the wrapper converts the
+  // rpc.response error into { error, hint? } per §6.1a. On deny and
+  // prompt-needed the wrapper behaves identically to wrapLocalTool.
 }
 ```
+
+**Return shape invariant (per §6.1a):** the allow-path returns exactly what `inner(args, ctx)` returns — no envelope, no `{ok: true, data: ...}` wrapping. Any error thrown by `inner` (including guard rejections and tool-specific runtime errors) is caught and turned into `{error, hint?}`. The LLM sees the raw natural shape on success and the discriminated error shape on failure. This matches cc-src/Claude Code conventions and Vercel AI SDK's default contract.
 
 ### 6.3 RPC envelope
 
@@ -306,17 +331,17 @@ export async function runSegment(
 }
 ```
 
-**`finishSegment(session, flusher, finishReason)` mapping** (per Vercel AI SDK v6 `finishReason` values):
+**`finishSegment(session, flusher, finishReason, stepCount)` mapping.** The SDK's `finishReason` alone is not enough to distinguish "natural tool-calls continuation" from "step cap reached", because Vercel AI SDK v6 reports both as `finishReason: 'tool-calls'` — the `stopWhen: stepCountIs(50)` mechanism stops the stream after emitting that finishReason. `finishSegment` therefore takes `stepCount` as an extra argument (read from `result.steps.length` on the streamText result, or tracked by `runSegment` incrementing a counter on each `tool-call` part) and uses it as a tiebreaker.
 
-| SDK `finishReason` | Returns | Notes |
-|---|---|---|
-| `'stop'` | `{ reason: 'natural' }` | LLM emitted end-of-turn naturally |
-| `'tool-calls'` | `{ reason: 'tool-calls' }` | runLoop continues to next segment |
-| `'length'` | `{ reason: 'error', error: 'context-length-exceeded' }` | max tokens reached mid-reply; Phase 2a treats as error (Phase 2b auto-compact) |
-| `'content-filter'` | `{ reason: 'error', error: 'content-filter' }` | Anthropic content policy; surface to user |
-| `'tool-calls'` with `stepCountIs(50)` also firing | `{ reason: 'step-cap' }` | Uses the existing Phase 1 `'step-cap'` finish reason value from `SegmentFinishReason` |
-| `'error'` | `{ reason: 'error', error: sanitized }` | SDK-reported stream error; sanitize via existing `sanitize-error.ts` before returning |
-| `'other'` / unknown | `{ reason: 'error', error: 'unknown-finish-reason' }` | Safety fallback; logs the raw value |
+| SDK `finishReason` | Condition | Returns | Notes |
+|---|---|---|---|
+| `'stop'` | — | `{ reason: 'natural' }` | LLM emitted end-of-turn naturally |
+| `'tool-calls'` | `stepCount < 50` | `{ reason: 'tool-calls' }` | runLoop continues to next segment |
+| `'tool-calls'` | `stepCount >= 50` | `{ reason: 'step-cap' }` | stepCountIs(50) fired; matches Phase 1's existing `'step-cap'` enum value |
+| `'length'` | — | `{ reason: 'error', error: 'context-length-exceeded' }` | max tokens reached mid-reply; Phase 2a treats as error (Phase 2b auto-compact) |
+| `'content-filter'` | — | `{ reason: 'error', error: 'content-filter' }` | Anthropic content policy; surface to user |
+| `'error'` | — | `{ reason: 'error', error: sanitized }` | some SDK versions emit this — sanitize via existing `sanitize-error.ts` before returning. Other versions surface errors via thrown exceptions caught in the outer catch; both paths are handled |
+| `'other'` / unknown | — | `{ reason: 'error', error: 'unknown-finish-reason' }` | Safety fallback; logs the raw value |
 
 In every case, `finishSegment` runs `await flusher.finalFlush()` and `await appendMessageFinish(session)` before returning, to ensure the last text buffer is persisted and the message is marked complete.
 
@@ -417,11 +442,11 @@ When `checkPermission` returns `prompt-needed`:
 6. Main's `suspension-router` dispatches `permission.prompt` to renderer with the card payload.
 7. Renderer shows PermissionCard; user clicks Allow / Allow Always / Deny.
 8. Renderer sends `permission.respond { cardId, action }` to main.
-9. Main updates session state based on action:
-   - **Allow**: record `singleUseApprovals.add(key)` in worker (via a new `session-state-update` IPC message or by piggy-backing on `resolve-suspension`).
-   - **Allow Always** (normal mode only, button hidden in strict): record `allowOnceClasses.add(approvalClass)`.
-   - **Deny**: no state change.
-10. Main sends `resolve-suspension { suspensionId, resolution: { kind: 'permission-allow' | 'permission-allow-always' | 'permission-deny' } }` to worker.
+9. Main decides what state update the worker needs to apply and attaches it to the `resolve-suspension` IPC payload (§12). State updates piggy-back on the resolution message; no separate IPC is used. Specifically:
+   - **Allow**: attach `stateUpdate: { addSingleUseKey: '<toolName>:<argsHash>' }` — the worker applies this to `session.singleUseApprovals` atomically with the resolution.
+   - **Allow Always** (normal mode only, button hidden in strict): attach `stateUpdate: { addAllowOnceClass: <approvalClass> }` — the worker applies this to `session.allowOnceClasses`.
+   - **Deny**: no `stateUpdate` field.
+10. Main sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to worker. Worker applies `stateUpdate` (if present) **before** rewriting the placeholder, so that the next segment's `checkPermission` sees the updated state from the very first tool call.
 11. Worker appends a synthetic user message to the session: `"[User decision on prior tool call: allow|deny]"`. (Plan task will finalize exact wording; the key constraint is that the LLM sees a normal user turn, not an assistant correction.)
 12. Worker emits a single `part-update` event that replaces the `{__suspended: true, suspensionId}` tool-result placeholder at its known `(messageId, partIndex)` with the resolved value: `{resolved: true, answer: '...'}` for questions, `{resolved: true}` for permission-allow, or `{error: 'user-denied'}` for permission-deny. This explicit rewrite owns the happy-path transition. `cleanupOrphanPlaceholders` is NOT called here — see §9.2 for the invariant.
 13. Worker deletes `suspension.json`, clears `pendingSuspension`.
@@ -620,10 +645,10 @@ New message types added to `src/shared/agent-protocol.ts`:
 - `tool-exec-status { sessionId, toolCallId, state: 'running' | 'done' | 'error' }` — renderer-only live status, relayed through main via `chief:event`; NOT persisted to the event log
 
 **Main → Worker**
-- `resolve-suspension { sessionId, suspensionId, resolution: SuspensionResolution }`
+- `resolve-suspension { sessionId, suspensionId, resolution: SuspensionResolution, stateUpdate?: { addSingleUseKey?: string; addAllowOnceClass?: ApprovalClass } }` — the optional `stateUpdate` piggy-backs on the resolution per §8.2 step 9. Worker applies it atomically before rewriting the placeholder.
 - `rpc.response { requestId, result: { ok, data | error } }`
 - `set-permission-mode { sessionId, mode: PermissionMode }`
-- `cancel-current-turn { sessionId }`
+- `cancel-current-turn { sessionId }` — worker looks up `session.currentAbortController` and calls `.abort()`; see §13.4.
 
 **Main → Renderer**
 - `chief:event { ...LogEvent | tool-exec-status | permission.prompt | ask.prompt | permission.cancel | ask.cancel }`
@@ -676,11 +701,21 @@ Phase 2a session in-memory state (not in meta.json):
 
 These five fields live on the worker's `Session` class instance and are set/cleared via explicit helper methods (not direct assignment). Tests exercise these helpers, not the raw fields.
 
-### 13.4 Single-session serialization
+### 13.4 Single-session serialization and cancellation wiring
 
-Session holds `currentRunPromise: Promise<void> | null`. `appendUserMessage + runLoop` checks this promise:
+**Serialization.** Session holds `currentRunPromise: Promise<void> | null`. `appendUserMessage + runLoop` checks this promise:
 - null → claim it, run, finally clear.
 - non-null → reject the new message with `{error: 'session-busy'}`; UI shows a toast "Chief Agent is still responding".
+
+**Cancellation.** Session holds `currentAbortController: AbortController | null`. The lifecycle:
+
+1. `runLoop` entry creates a new `AbortController` and sets `session.currentAbortController = controller`.
+2. `runLoop` passes `controller.signal` as the `externalAbort` argument to every `runSegment` call within its while-loop.
+3. When main receives a `cancel-current-turn { sessionId }` IPC message, it looks up the session and forwards it to the worker. The worker handler calls `session.currentAbortController?.abort()`.
+4. `runSegment`'s combined AbortSignal (§7.1) fires, `streamText` throws `AbortError`, `runSegment` returns `{reason: 'aborted'}`.
+5. `runLoop` sees `aborted` and returns; the `finally` block clears `session.currentAbortController = null` and `session.currentRunPromise = null`.
+
+The controller is recreated per `runLoop` invocation — it never outlives a single user-turn's work.
 
 ## 14. Testing Strategy
 
