@@ -82,10 +82,9 @@ Phase 2a tightens or clarifies the following points in the parent spec:
    - `finish`: note `finishReason`.
 4. **Tool call execution.** When Vercel AI SDK invokes `tool.execute(args, ctx)`:
    - `manifest-wrapper` looks up the manifest entry, validates args against the schema, computes `summary`.
-   - `checkPermission(session.meta.permissionMode, manifest.approvalClass, session.allowOnceClasses, session.singleUseApprovals)` returns `allow` / `deny` / `prompt-needed`.
-   - **allow**: for `execution: 'local'`, run the inner executor; for `execution: 'rpc'`, send `rpc.request { kind: 'tool.exec' }` and await the response.
-   - **deny**: return `{ error: 'user-denied' }` as tool-result (no prompt).
-   - **prompt-needed**: push a `permission` SuspensionSpec to `session.pendingSuspension`, write a `{__suspended: true}` placeholder tool-result, throw `SuspensionSignal`. `runSegment` catches the signal, persists `suspension.json`, and returns `{ reason: 'suspended' }`.
+   - `checkPermission(session, manifest.approvalClass, manifest.name, args)` returns one of exactly two values: `allow` or `prompt-needed`. (There is no `deny` return — user denials live in the rewritten tool_result after a resolved suspension, not in a denial cache. See §8.1.)
+   - **allow**: for `execution: 'local'`, run the inner executor; for `execution: 'rpc'`, send `rpc.request { kind: 'tool.exec' }` and await the response. Either path returns the raw tool output, or `{error, hint?}` if the executor throws.
+   - **prompt-needed**: push a `permission` SuspensionSpec to `session.pendingSuspension`, write a `{__suspended: true}` placeholder tool-result via `part-append`, throw `SuspensionSignal`. `runSegment` catches the signal, persists `suspension.json`, and returns `{ reason: 'suspended' }`. The actual tool execution happens later, inside the resolution handler (§8.2 step 10b), not by retrying this code path.
 5. **Suspending tools (AskUserQuestion).** `AskUserQuestion` is `execution: 'local'`, `approvalClass: 'ui'` per the parent spec §6.3a assignment (updated 2026-04-15). It is a worker-side control-flow tool, colocated with other suspending tools. When the LLM invokes it, the wrapper pushes a `{ kind: 'question' }` SuspensionSpec onto `session.pendingSuspension`, writes a `{__suspended: true}` placeholder via `part-append`, and throws `SuspensionSignal`. `runSegment` catches the signal and ends the segment through the same code path as permission suspensions. Main's `suspension-router` receives the `suspension-raised` IPC and dispatches `ask.prompt` to the renderer for UI mediation — main is never the executor of the tool, only the host of the card.
 6. **runLoop follows finish reason.** `tool-calls` → continue to next segment. Anything else → persist `lastSegmentReason` and return.
 7. **Suspension resolution.** Main's `suspension-router` receives `suspension-raised`, looks at `spec.kind`, dispatches `permission.prompt` or `ask.prompt` to the renderer. Renderer shows the appropriate card. User action → `resolve-suspension` IPC back to main → main builds the resolution + optional `stateUpdate` → main forwards `resolve-suspension` to worker → worker's resolution handler applies `stateUpdate`, then:
@@ -660,7 +659,7 @@ New message types added to `src/shared/agent-protocol.ts`:
 - `tool-exec-status { sessionId, toolCallId, state: 'running' | 'done' | 'error' }` — renderer-only live status, relayed through main via `chief:event`; NOT persisted to the event log
 
 **Main → Worker**
-- `resolve-suspension { sessionId, suspensionId, resolution: SuspensionResolution, stateUpdate?: { addSingleUseKey?: string; addAllowOnceClass?: ApprovalClass } }` — the optional `stateUpdate` piggy-backs on the resolution per §8.2 step 9. Worker applies it atomically before rewriting the placeholder.
+- `resolve-suspension { sessionId, suspensionId, resolution: SuspensionResolution, stateUpdate?: { addAllowOnceClass?: ApprovalClass } }` — the optional `stateUpdate` piggy-backs on the resolution per §8.2 step 9. Only `permission-allow-always` sends a stateUpdate; plain `permission-allow` does not, because the tool executes during resolution (§8.2 step 10b) and there's no "next call" to cache for. Worker applies the stateUpdate atomically before rewriting the placeholder.
 - `rpc.response { requestId, result: { ok, data | error } }`
 - `set-permission-mode { sessionId, mode: PermissionMode }`
 - `cancel-current-turn { sessionId }` — worker looks up `session.currentAbortController` and calls `.abort()`; see §13.4.

@@ -159,7 +159,7 @@ type ToWorker =
         | { kind: 'permission-allow' }
         | { kind: 'permission-allow-always' }
         | { kind: 'permission-deny' },
-      stateUpdate?: { addSingleUseKey?: string; addAllowOnceClass?: ApprovalClass }
+      stateUpdate?: { addAllowOnceClass?: ApprovalClass }
     }
   // Settings
   | { type: 'set-permission-mode', sessionId: string, mode: PermissionMode }
@@ -428,7 +428,7 @@ export const allTools = (session: Session) => ({
 - **Async / streaming**: tools can be async (all of OneShip's are). Tools can also yield intermediate progress via `AsyncIterable`, used by `Bash` to stream stdout into the UI during execution.
 - **Abort**: the `abortSignal` from the execute context is threaded through any spawned child processes, so `session.cancelCurrentTurn()` actually kills in-flight bash commands. Tool implementations must treat abort as cooperative — clean up shell handles, file descriptors, etc.
 - **Suspending tools**: `AskUserQuestion`, `ExitPlanMode`, and any tool whose `checkPermission` returns `prompt-needed` do not block inside `execute()`. They push a `SuspensionSpec` onto `session.pendingSuspension`, return a placeholder tool-result (`{ __suspended: true, suspensionId }`), and the session loop ends the segment cleanly via abort. See §15.5 for the full lifecycle.
-- **Permission gating**: before execution, the worker-side tool wrapper calls `checkPermission` (§12.2) against the session's mirror of the current permission mode. If the result is `allow`, the tool runs; if `deny`, it returns `{ error: 'user-denied' }` immediately; if `prompt-needed`, a `permission` SuspensionSpec is raised (§12.3). Under the §6.3a permission system, this happens uniformly across all modes (trust / normal / strict) and all approval classes (read / write / exec / ui).
+- **Permission gating**: before execution, the worker-side tool wrapper calls `checkPermission` (§12.2) against the session's mirror of the current permission mode. The function returns exactly one of two values: `allow` (the tool runs immediately inside the current segment) or `prompt-needed` (the wrapper raises a `permission` SuspensionSpec and the segment ends; the tool eventually runs inside the resolution handler per §12.3 step 7b, or the user denies and the placeholder is rewritten to `{ error: 'user-denied' }` per §12.3 step 7c). There is no `deny` return value from `checkPermission` — user denials live in the rewritten tool_result, not in a denial cache. This happens uniformly across all modes (trust / normal / strict) and all approval classes (read / write / exec / ui).
 - **Plan Mode mask**: in Plan Mode, `allTools()` omits `Write / Edit / Bash / CronCreate / CronDelete / Agent` **and** restricts `Skill`. The LLM only sees the remaining tools. See §11.1 for the Skill-in-PlanMode rules; the short version is that Skill is *not* removed (so the model can still invoke read-only skills) but the sub-agent it spawns inherits Plan Mode and the same mask is applied recursively.
 
 ### 6.3a Tool execution topology (Phase 2 addendum — authoritative)
@@ -954,12 +954,12 @@ When `checkPermission` returns `prompt-needed`, the tool call is suspended. The 
 3. Worker sends `suspension-raised { sessionId, spec }` to main.
 4. Main's `suspension-router` dispatches `permission.prompt { cardId, spec }` to the renderer. The renderer shows a PermissionCard with Allow / Allow Always (normal mode only; hidden in strict) / Deny buttons.
 5. User clicks a button. Renderer sends `permission.respond { cardId, action }` to main.
-6. Main translates the action to a resolution and a state update, and sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to the worker:
-   - **Allow** → `resolution: { kind: 'permission-allow' }`, `stateUpdate: { addSingleUseKey }`
-   - **Allow Always** → `resolution: { kind: 'permission-allow-always' }`, `stateUpdate: { addAllowOnceClass }`
-   - **Deny** → `resolution: { kind: 'permission-deny' }`, no `stateUpdate`
+6. Main translates the action to a resolution and sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to the worker:
+   - **Allow** → `resolution: { kind: 'permission-allow' }`. **No `stateUpdate`** — the tool will execute during resolution (step 7b), so there is nothing to cache for a future call.
+   - **Allow Always** → `resolution: { kind: 'permission-allow-always' }`, `stateUpdate: { addAllowOnceClass }`. The allowlist entry applies to any *subsequent* tool call in the same approvalClass; the current call still executes during resolution just like plain Allow.
+   - **Deny** → `resolution: { kind: 'permission-deny' }`, no `stateUpdate`.
 7. Worker's resolution handler:
-   a. Applies `stateUpdate` (if present) — adds to `session.allowOnceClasses` or `session.singleUseApprovals`.
+   a. Applies `stateUpdate` (if present) — adds to `session.allowOnceClasses`.
    b. For **Allow** / **Allow Always**: **actually invokes the tool now**, outside of any `runSegment`. The wrapper synthesizes a fresh `ExecContext` using the session, the toolCallId from the SuspensionSpec, and a new `AbortController` tied to `session.currentAbortController`. It runs `inner(args, ctx)` for local tools, or sends `rpc.request { kind: 'tool.exec' }` to main for rpc tools. The return value is the real tool output (a string for Read, a `{stdout, stderr, exitCode}` for Bash, etc.). If the executor throws, it becomes `{error, hint?}`.
    c. For **Deny**: skip tool execution. The resolved result is `{error: 'user-denied'}`.
    d. Emits a single `part-update` replacing the `{__suspended: true}` placeholder with the resolved tool-result (the real tool output, or `{error: 'user-denied'}`).
