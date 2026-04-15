@@ -8,34 +8,7 @@
     "build": "electron-vite build",
     "test": "vitest --run",
     "preview": "electron-vite preview",
-    "pack": "node scripts/check-macos-distribution-prereqs.mjs && electron-vite build && electron-builder --mac --config",
-    "pack:dev": "electron-vite build && electron-builder --mac --config electron-builder.dev.config.cjs"
-  },
-  "build": {
-    "appId": "com.oneship.app",
-    "productName": "Oneship",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "dist/**/*",
-      "node_modules/**/*"
-    ],
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "target": "dmg",
-      "icon": "build/icon.icns",
-      "type": "distribution",
-      "identity": "Developer ID Application",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
-      "notarize": true
-    },
-    "forceCodeSigning": true,
-    "npmRebuild": true,
-    "nodeGypRebuild": false
+    "app:make": "electron-vite build && electron-builder --mac --config electron-builder.config.cjs"
   },
   "keywords": [],
   "author": "",

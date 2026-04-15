@@ -4,7 +4,16 @@ import { describe, it, expect } from 'vitest'
 // respawn rate-limiter and the ready-ticket idempotency — and leave the
 // full integration-level check for a dev-mode smoke test (Task 13).
 
-import { RespawnGate, makeReadyTicket } from '../agent-host'
+import { RespawnGate, buildWorkerEnv, makeReadyTicket } from '../agent-host'
+
+describe('buildWorkerEnv', () => {
+  it('injects ONESHIP_AGENT_ROOT into the worker env', () => {
+    expect(buildWorkerEnv({ PATH: '/bin' }, '/tmp/oneship-dev')).toMatchObject({
+      PATH: '/bin',
+      ONESHIP_AGENT_ROOT: '/tmp/oneship-dev',
+    })
+  })
+})
 
 describe('RespawnGate', () => {
   it('allows up to 3 respawns within the window', () => {

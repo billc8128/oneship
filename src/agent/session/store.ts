@@ -3,8 +3,14 @@ import { join } from 'path'
 import { atomicWriteJson, readJsonOrNull, ensureDir } from '../services/fs'
 import type { SessionMeta } from '../../shared/agent-protocol'
 
+type SessionEnv = NodeJS.ProcessEnv | Record<string, string | undefined>
+
+export function agentRoot(env: SessionEnv = process.env, homeDir = homedir()): string {
+  return env.ONESHIP_AGENT_ROOT || join(homeDir, '.oneship')
+}
+
 export function sessionsRoot(): string {
-  return join(homedir(), '.oneship', 'sessions')
+  return join(agentRoot(), 'sessions')
 }
 
 export function sessionDir(sessionId: string): string {

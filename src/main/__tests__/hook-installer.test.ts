@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,6 +11,25 @@ describe('installHooks', () => {
     homeDir = mkdtempSync(join(tmpdir(), 'oneship-hook-installer-'))
   })
 
+  it('writes the bridge script to an injected bridge directory', async () => {
+    vi.doMock('os', async () => {
+      const actual = await vi.importActual<typeof import('node:os')>('node:os')
+      return {
+        ...actual,
+        homedir: () => homeDir,
+      }
+    })
+
+    try {
+      const bridgeDir = join(homeDir, '.oneship-dev', 'bin')
+      const { installHooks } = await import('../hook-installer')
+      expect(installHooks({ bridgeDir })).toEqual({ installed: true })
+      expect(existsSync(join(bridgeDir, 'oneship-bridge.js'))).toBe(true)
+    } finally {
+      rmSync(homeDir, { recursive: true, force: true })
+    }
+  })
+
   it('installs the current Claude hook events needed for status tracking', async () => {
     vi.doMock('os', async () => {
       const actual = await vi.importActual<typeof import('node:os')>('node:os')
@@ -21,8 +40,9 @@ describe('installHooks', () => {
     })
 
     try {
+      const bridgeDir = join(homeDir, '.oneship-dev', 'bin')
       const { installHooks } = await import('../hook-installer')
-      expect(installHooks()).toEqual({ installed: true })
+      expect(installHooks({ bridgeDir })).toEqual({ installed: true })
 
       const settings = JSON.parse(readFileSync(join(homeDir, '.claude', 'settings.json'), 'utf-8')) as {
         hooks: Record<string, unknown[]>
@@ -59,26 +79,28 @@ describe('installHooks', () => {
 
     try {
       const codexDir = join(homeDir, '.codex')
+      const bridgeDir = join(homeDir, '.oneship-dev', 'bin')
+      const bridgePath = join(bridgeDir, 'oneship-bridge.js')
       mkdirSync(codexDir, { recursive: true })
       writeFileSync(join(codexDir, 'hooks.json'), JSON.stringify({
         hooks: {
           Notification: [
             {
               matcher: '*',
-              hooks: [{ type: 'command', command: 'node "/tmp/oneship-bridge.js" --source=codex' }],
+              hooks: [{ type: 'command', command: `node "${bridgePath}" --source=codex` }],
             },
           ],
           PermissionRequest: [
             {
               matcher: '*',
-              hooks: [{ type: 'command', command: 'node "/tmp/oneship-bridge.js" --source=codex', timeout: 86400 }],
+              hooks: [{ type: 'command', command: `node "${bridgePath}" --source=codex`, timeout: 86400 }],
             },
           ],
         },
       }), 'utf-8')
 
       const { installHooks } = await import('../hook-installer')
-      expect(installHooks()).toEqual({ installed: true })
+      expect(installHooks({ bridgeDir })).toEqual({ installed: true })
 
       const config = JSON.parse(readFileSync(join(homeDir, '.codex', 'hooks.json'), 'utf-8')) as {
         hooks: Record<string, Array<Record<string, unknown>>>
@@ -103,6 +125,51 @@ describe('installHooks', () => {
       })
       expect(config.hooks.UserPromptSubmit[0]).not.toHaveProperty('matcher')
       expect(config.hooks.Stop[0]).not.toHaveProperty('matcher')
+    } finally {
+      rmSync(homeDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to overwrite an existing Claude config that points at another Oneship bridge', async () => {
+    vi.doMock('os', async () => {
+      const actual = await vi.importActual<typeof import('node:os')>('node:os')
+      return {
+        ...actual,
+        homedir: () => homeDir,
+      }
+    })
+
+    try {
+      const claudeDir = join(homeDir, '.claude')
+      const settingsPath = join(claudeDir, 'settings.json')
+      const bridgeDir = join(homeDir, '.oneship-dev', 'bin')
+      mkdirSync(claudeDir, { recursive: true })
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  {
+                    type: 'command',
+                    command: 'node "/tmp/other-oneship-bridge.js" --source=claude',
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+        'utf-8',
+      )
+
+      const before = readFileSync(settingsPath, 'utf8')
+      const { installHooks } = await import('../hook-installer')
+      const result = installHooks({ bridgeDir })
+
+      expect(result.installed).toBe(false)
+      expect(result.error).toContain('already configured for another Oneship bridge')
+      expect(readFileSync(settingsPath, 'utf8')).toBe(before)
     } finally {
       rmSync(homeDir, { recursive: true, force: true })
     }

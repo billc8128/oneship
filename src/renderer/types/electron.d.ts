@@ -1,4 +1,13 @@
 import type { TerminalThemeDefinition, TerminalThemePatch, TerminalThemeState } from '../../shared/terminal-theme'
+import type { ToWorker, ToMain } from '../../shared/agent-protocol'
+
+// =============================================================================
+// PHASE-5 TODO: legacy ProjectChat types kept alive during Phases 1-4.
+// ProjectChat still uses the {role,content} message model and the chat:* IPC.
+// Phase 5 migrates ProjectChat to the agent worker and at that point ChatMessage,
+// ChatConversation, ChatAPI, and the `chat: ChatAPI` field on ElectronAPI all go
+// away. Chief Agent (Phase 1+) uses `chief: ChiefAPI` below instead.
+// =============================================================================
 
 interface ChatMessage {
   id: string
@@ -19,6 +28,20 @@ interface ChatAPI {
   getConversation: (projectId: string | null) => Promise<ChatConversation>
   sendMessage: (projectId: string | null, content: string) => Promise<ChatConversation>
   getMessages: (projectId: string | null) => Promise<ChatMessage[]>
+}
+
+interface ChiefAPI {
+  /**
+   * Send a typed ToWorker message to the agent worker. Returns a resolved
+   * promise — the Main-side handler is fire-and-forget. Actual replies
+   * arrive asynchronously via `onEvent`.
+   */
+  send: (message: ToWorker) => Promise<void>
+  /**
+   * Subscribe to ToMain events broadcast from the agent worker. Returns an
+   * unsubscribe function.
+   */
+  onEvent: (callback: (message: ToMain) => void) => () => void
 }
 
 interface TerminalAPI {
@@ -157,6 +180,7 @@ interface ElectronAPI {
   homeDir: string
   store: StoreAPI
   chat: ChatAPI
+  chief: ChiefAPI
   fs: FsAPI
   hook: {
     getStatus: () => Promise<HookRuntimeStatus>

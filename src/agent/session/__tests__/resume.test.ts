@@ -5,16 +5,20 @@ import { join } from 'path'
 import { enumerateSessionMetas } from '../resume'
 
 let originalHome: string | undefined
+let originalAgentRoot: string | undefined
 let tmp: string
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), 'oneship-resume-test-'))
   originalHome = process.env.HOME
+  originalAgentRoot = process.env.ONESHIP_AGENT_ROOT
   process.env.HOME = tmp
+  process.env.ONESHIP_AGENT_ROOT = join(tmp, '.oneship-dev')
 })
 
 afterEach(() => {
   process.env.HOME = originalHome
+  process.env.ONESHIP_AGENT_ROOT = originalAgentRoot
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -24,7 +28,7 @@ describe('resume', () => {
   })
 
   it('returns metas for each session directory', async () => {
-    const root = join(tmp, '.oneship', 'sessions')
+    const root = join(tmp, '.oneship-dev', 'sessions')
     mkdirSync(join(root, 's_a'), { recursive: true })
     mkdirSync(join(root, 's_b'), { recursive: true })
     writeFileSync(join(root, 's_a', 'meta.json'), JSON.stringify({
@@ -48,7 +52,7 @@ describe('resume', () => {
   })
 
   it('skips directories without meta.json', async () => {
-    const root = join(tmp, '.oneship', 'sessions')
+    const root = join(tmp, '.oneship-dev', 'sessions')
     mkdirSync(join(root, 's_orphan'), { recursive: true })
     expect(await enumerateSessionMetas()).toEqual([])
   })
@@ -57,7 +61,7 @@ describe('resume', () => {
     // A previous worker crash could leave a half-written meta.json on disk.
     // enumeration must survive that — one bad session must NOT block all
     // other sessions from loading.
-    const root = join(tmp, '.oneship', 'sessions')
+    const root = join(tmp, '.oneship-dev', 'sessions')
     mkdirSync(join(root, 's_broken'), { recursive: true })
     mkdirSync(join(root, 's_good'), { recursive: true })
     writeFileSync(join(root, 's_broken', 'meta.json'), '{ this is not valid json')

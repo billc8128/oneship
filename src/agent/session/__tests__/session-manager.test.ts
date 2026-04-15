@@ -5,16 +5,20 @@ import { join } from 'path'
 import { SessionManager } from '../session-manager'
 
 let originalHome: string | undefined
+let originalAgentRoot: string | undefined
 let tmp: string
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), 'oneship-mgr-test-'))
   originalHome = process.env.HOME
+  originalAgentRoot = process.env.ONESHIP_AGENT_ROOT
   process.env.HOME = tmp
+  process.env.ONESHIP_AGENT_ROOT = join(tmp, '.oneship-dev')
 })
 
 afterEach(() => {
   process.env.HOME = originalHome
+  process.env.ONESHIP_AGENT_ROOT = originalAgentRoot
   rmSync(tmp, { recursive: true, force: true })
 })
 

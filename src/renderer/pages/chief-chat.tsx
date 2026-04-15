@@ -1,29 +1,14 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useChiefSession } from '../stores/chief-session'
 import { VennLogo } from '../components/ui/venn-logo'
-import { MessageList } from '../components/chat/message-list'
 import { ChatInput } from '../components/chat/chat-input'
+import { UserBubble } from '../components/chat/messages/user-bubble'
+import { AssistantText } from '../components/chat/messages/assistant-text'
+import { SystemNotice } from '../components/chat/messages/system-notice'
 import { useProjects } from '../stores/project-store'
 
 export function ChiefChat() {
   const { projects } = useProjects()
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [sending, setSending] = useState(false)
-
-  useEffect(() => {
-    window.electronAPI.chat.getConversation(null).then((conv) => {
-      setMessages(conv.messages)
-    })
-  }, [])
-
-  const handleSend = useCallback(async (content: string) => {
-    setSending(true)
-    try {
-      const conv = await window.electronAPI.chat.sendMessage(null, content)
-      setMessages(conv.messages)
-    } finally {
-      setSending(false)
-    }
-  }, [])
+  const { status, uiMessages, sendUserMessage, error } = useChiefSession()
 
   return (
     <div className="flex flex-col h-full">
@@ -37,12 +22,22 @@ export function ChiefChat() {
         </div>
       </div>
 
-      <MessageList messages={messages} />
+      <div className="flex-1 overflow-y-auto px-6 py-6">
+        {status === 'booting' && <SystemNotice text="Connecting to Chief Agent…" />}
+        {error && <SystemNotice text={`Error: ${error}`} />}
+        {uiMessages.map((msg) =>
+          msg.role === 'user' ? (
+            <UserBubble key={msg.id} message={msg} />
+          ) : msg.role === 'assistant' ? (
+            <AssistantText key={msg.id} message={msg} />
+          ) : null
+        )}
+      </div>
 
       <ChatInput
         placeholder="Message Chief Agent..."
-        onSend={handleSend}
-        disabled={sending}
+        onSend={sendUserMessage}
+        disabled={status === 'sending' || status === 'booting' || status === 'error'}
       />
     </div>
   )

@@ -3,23 +3,27 @@ import { mkdtempSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Session } from '../session'
-import { sessionDir, eventLogPath, readMeta } from '../store'
+import { agentRoot, sessionDir, eventLogPath, readMeta } from '../store'
 import { readEvents } from '../../services/event-log'
 import { isMessageComplete } from '../../services/conversation-store'
 
 // All tests redirect ~/.oneship/sessions to a tmpdir so they don't pollute
 // the real user data directory.
 let originalHome: string | undefined
+let originalAgentRoot: string | undefined
 let tmp: string
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), 'oneship-session-test-'))
   originalHome = process.env.HOME
+  originalAgentRoot = process.env.ONESHIP_AGENT_ROOT
   process.env.HOME = tmp
+  process.env.ONESHIP_AGENT_ROOT = join(tmp, '.oneship-dev')
 })
 
 afterEach(() => {
   process.env.HOME = originalHome
+  process.env.ONESHIP_AGENT_ROOT = originalAgentRoot
   rmSync(tmp, { recursive: true, force: true })
 })
 
@@ -30,7 +34,7 @@ describe('Session', () => {
 
     // session directory is under the redirected HOME
     const dir = sessionDir('s_abc')
-    expect(dir.startsWith(tmp)).toBe(true)
+    expect(dir.startsWith(join(tmp, '.oneship-dev'))).toBe(true)
 
     // meta.json actually round-trips through disk
     const onDisk = await readMeta('s_abc')
@@ -108,5 +112,9 @@ describe('Session', () => {
     // The stub reply stands in for a completed LLM segment, so it DOES
     // write the finish reason.
     expect(session.meta.lastSegmentReason).toBe('natural')
+  })
+
+  it('prefers ONESHIP_AGENT_ROOT over HOME when deriving the agent root', () => {
+    expect(agentRoot(process.env, process.env.HOME!)).toBe(join(tmp, '.oneship-dev'))
   })
 })

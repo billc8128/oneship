@@ -35,6 +35,9 @@ import { TerminalThemeStore } from './terminal-theme-store'
 import type { TerminalThemePatch } from '../shared/terminal-theme'
 import { AgentHost } from './agent-host'
 import type { ToWorker } from '../shared/agent-protocol'
+import { installRuntimeUserDataPath, runtimePaths, shouldAutoInstallHooks } from './runtime-paths'
+
+installRuntimeUserDataPath()
 
 const MAX_TEXT_SIZE = 100 * 1024 // 100KB
 
@@ -723,10 +726,13 @@ function setupApplicationMenu() {
 app.whenReady().then(async () => {
   sessionStore.markLiveSessionsAsInterrupted()
 
-  const hookInstallResult = installHooks()
-  hookRuntimeStatus.installed = hookInstallResult.installed
-  if (hookInstallResult.error) {
-    hookRuntimeStatus.lastError = hookInstallResult.error
+  const paths = runtimePaths()
+  if (shouldAutoInstallHooks(paths.profile, process.env)) {
+    const hookInstallResult = installHooks({ bridgeDir: paths.hookBridgeDir })
+    hookRuntimeStatus.installed = hookInstallResult.installed
+    if (hookInstallResult.error) {
+      hookRuntimeStatus.lastError = hookInstallResult.error
+    }
   }
 
   setupApplicationMenu()

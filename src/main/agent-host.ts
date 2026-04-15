@@ -2,6 +2,7 @@ import { utilityProcess, type UtilityProcess, app } from 'electron'
 import { join } from 'path'
 import type { ToWorker, ToMain } from '../shared/agent-protocol'
 import { isToMain } from '../shared/agent-protocol'
+import { runtimePaths } from './runtime-paths'
 
 /**
  * Tracks recent respawn timestamps and decides whether another respawn
@@ -28,6 +29,16 @@ export interface AgentHostOptions {
 }
 
 export type ToMainListener = (message: ToMain) => void
+
+export function buildWorkerEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  agentRoot: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    ONESHIP_AGENT_ROOT: agentRoot,
+  }
+}
 
 /**
  * Internal: a single "I'm waiting for the worker to be ready" ticket.
@@ -138,6 +149,7 @@ export class AgentHost {
     console.log('[agent-host] forking worker:', path)
 
     const proc = utilityProcess.fork(path, [], {
+      env: buildWorkerEnv(process.env, runtimePaths().agentRoot),
       stdio: 'inherit',
       serviceName: 'oneship-agent',
     })
@@ -165,23 +177,42 @@ export class AgentHost {
         // The new spawn shares the same currentReadyTicket. If it succeeds,
         // start() unblocks. If it also dies pre-ready, we recurse here.
       } else {
+        const reason = `Agent worker respawn rate exceeded (${this.respawnGate.opts.max} crashes within ${this.respawnGate.opts.windowMs}ms)`
         console.error('[agent-host] respawn rate exceeded; giving up')
         // If anything is still waiting on currentReadyTicket, free them.
-        this.settleReady(
-          'reject',
-          new Error(
-            `Agent worker respawn rate exceeded (${this.respawnGate.opts.max} crashes within ${this.respawnGate.opts.windowMs}ms)`
-          )
-        )
-        // Phase 2+ will also surface this to the UI as a banner.
+        // (This is a no-op if the ticket already resolved on an earlier
+        // successful ready — that's the post-ready crash path.)
+        this.settleReady('reject', new Error(reason))
+        // Broadcast a synthetic `worker-unavailable` ToMain to every
+        // listener so the UI can surface a real error instead of leaving
+        // in-flight `sending` state hanging forever. This is the post-
+        // ready-exhaustion path's only signal to the renderer — without
+        // it, the UI sits stuck with no idea the worker is gone.
+        const unavailable: ToMain = { type: 'worker-unavailable', reason }
+        for (const l of this.listeners) l(unavailable)
       }
     })
   }
 
+  /**
+   * Post a ToWorker message to the live worker. Throws if no worker is
+   * live (either not yet started, or the respawn gate exhausted after a
+   * post-ready crash). Callers — specifically the `chief:send` IPC handler
+   * in Main — should let the throw propagate so it becomes a Promise
+   * rejection across the IPC boundary, and the renderer's
+   * `sendUserMessage` catches it and flips status back to error.
+   *
+   * This replaces the earlier warn-and-drop behavior, which left the
+   * renderer stuck in 'sending' with no signal that the send actually
+   * went nowhere.
+   */
   send(message: ToWorker): void {
     if (!this.proc) {
-      console.warn('[agent-host] send called with no live worker; dropping', message.type)
-      return
+      throw new Error(
+        `Agent worker is not available (message type: ${message.type}). ` +
+          `The worker has either not started yet or the respawn gate exhausted ` +
+          `after repeated crashes.`
+      )
     }
     this.proc.postMessage(message)
   }

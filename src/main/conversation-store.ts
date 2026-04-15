@@ -1,6 +1,6 @@
-import { app } from 'electron'
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs'
 import { join } from 'path'
+import { runtimePaths } from './runtime-paths'
 
 export interface Message {
   id: string
@@ -21,7 +21,7 @@ const GE_DIR = '.oneship'
 const CONVERSATIONS_DIR = 'conversations'
 
 function chiefConversationsDir(): string {
-  const dir = join(app.getPath('userData'), '..', 'ge', CONVERSATIONS_DIR)
+  const dir = join(runtimePaths().globalState, CONVERSATIONS_DIR)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   return dir
 }

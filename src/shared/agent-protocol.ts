@@ -110,6 +110,12 @@ export type ToMain =
       reason: SegmentFinishReason
       error?: string
     }
+  // Synthetic message emitted by AgentHost (NOT by the worker) when the
+  // respawn gate exhausts and the worker is no longer being restarted.
+  // Carries no sessionId because it's a global state — every open session
+  // in the renderer is affected. Phase 2 will add a "restart" IPC the
+  // renderer can use to reset the gate and try again.
+  | { type: 'worker-unavailable'; reason: string }
 // PHASE-2+: 'task-changed'
 // PHASE-4: 'suspension-raised'
 // PHASE-2+: 'rpc-request' (Worker asks Main for project data, dialogs, etc.)
@@ -137,6 +143,7 @@ const TO_MAIN_TYPES = new Set<ToMain['type']>([
   'message-delta',
   'message-complete',
   'segment-finished',
+  'worker-unavailable',
 ])
 
 export function isToWorker(value: unknown): value is ToWorker {
