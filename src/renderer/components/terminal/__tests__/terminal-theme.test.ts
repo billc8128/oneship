@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   defaultResolvedTerminalTheme,
+  getTerminalPanelStyle,
   terminalTabsBarClassName,
   terminalViewPanelClassName,
   terminalViewShellClassName,
@@ -27,5 +28,12 @@ describe('terminal theme', () => {
     expect(terminalViewPanelClassName).not.toContain('border')
     expect(terminalViewPanelClassName).not.toContain('shadow')
     expect(terminalTabsBarClassName).toContain('bg-surface')
+  })
+
+  it('exposes the active xterm background as a CSS variable for the viewport gutter', () => {
+    const panelStyle = getTerminalPanelStyle(defaultResolvedTerminalTheme) as Record<string, string>
+
+    expect(panelStyle.backgroundColor).toBe(defaultResolvedTerminalTheme.chrome.terminalBackground)
+    expect(panelStyle['--terminal-viewport-background']).toBe(defaultResolvedTerminalTheme.xterm.background)
   })
 })

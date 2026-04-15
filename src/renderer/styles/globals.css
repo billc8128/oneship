@@ -35,7 +35,7 @@ body {
 
 /* xterm.js scrollbar — thin, subtle, like Ghostty */
 .xterm .xterm-viewport {
-  background-color: transparent;
+  background-color: var(--terminal-viewport-background, #000);
   scrollbar-gutter: stable;
 }
 
