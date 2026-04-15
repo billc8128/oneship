@@ -45,7 +45,7 @@ This spec defines the real Chief Agent: a long-running, multi-turn LLM orchestra
 | **Task** | A structured work item (JSONL persisted). Used for planning, DAG dependencies, and cross-turn tracking. Manipulated via `TaskCreate / TaskUpdate / TaskList / TaskGet`. |
 | **Session** | One conversation + its full state (messages, tasks, memory). Persisted to disk, survives restarts. |
 | **Plan Mode** | A runtime mode in which destructive tools (Write/Edit/Bash) are disabled and Chief Agent must produce and get approval on a plan before continuing. |
-| **Trust / Cautious mode** | Permission modes. Trust = no per-tool confirmation (default). Cautious = Bash/Write/Edit trigger a native confirmation dialog. |
+| **Permission modes** | `trust` / `normal` / `strict`. Trust = no per-tool confirmation. Normal = prompt for write/exec classes (default). Strict = prompt for read/write/exec. `ui` class (AskUserQuestion) is pass-through in all modes. See §12. |
 | **Compaction** | A separate LLM call that summarizes old turns to free context budget. Triggered when the context window fills. |
 | **Prompt cache boundary** | A marker in the system prompt separating static (cacheable) from dynamic (per-turn) content, to maximize Anthropic `cache_control: ephemeral` hit rate. |
 
@@ -553,7 +553,7 @@ Following cc-src's `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` pattern (`cc-src/constants/p
 2. List of registered projects with their paths and statuses
 3. Currently active Chief Agent tasks (from task-store)
 4. Recent session memory snippets (V1, §7.4)
-5. Current permission mode (Trust / Cautious)
+5. Current permission mode (Trust / Normal / Strict)
 6. Currently selected model
 
 The split is realized at streamtext time:
@@ -822,7 +822,7 @@ When a cron fires:
 1. The scheduler creates a **new session** via the same `create-session` IPC the user uses to start a fresh chat, with `triggeredBy: { kind: 'cron', cronId }`.
 2. The new session's `meta.json` records the cron id and the scheduled time, so the UI can group autonomous sessions separately.
 3. The session starts with a synthetic system hint `[Triggered by cron job <id> on <schedule>]` followed by the cron's `prompt` as the first user message.
-4. The session runs to completion (or until `stepCountIs(N)` hits, or it raises a suspension). For **cron-triggered sessions**, Plan/Ask suspensions are treated as failures: the segment is finished as `error`, the suspension is recorded but no human-facing card is shown, and a one-line entry is posted to the activity feed: "Cron job <id> needed input but no one was watching: <question or plan title>". The user can later open the autonomous session, see the suspension card, and resolve it manually — at which point the session resumes normally. Cautious suspensions in a cron context: the cron's own permission mode is forced to **Trust** at session creation, so Cautious never fires from cron-triggered work. (Open question §19-12 has additional details.)
+4. The session runs to completion (or until `stepCountIs(N)` hits, or it raises a suspension). For **cron-triggered sessions**, Plan/Ask suspensions are treated as failures: the segment is finished as `error`, the suspension is recorded but no human-facing card is shown, and a one-line entry is posted to the activity feed: "Cron job <id> needed input but no one was watching: <question or plan title>". The user can later open the autonomous session, see the suspension card, and resolve it manually — at which point the session resumes normally. Permission suspensions in a cron context: the cron's own permission mode is forced to **Trust** at session creation, so no `prompt-needed` decisions ever fire from cron-triggered work. (Open question §19-12 has additional details.)
 5. A brief "Cron fired" notification is posted to the UI activity feed regardless of whether the user has the new session open.
 
 Chief Agent chat UI shows cron-triggered sessions in a separate "Autonomous" group in the session picker (§16.6), distinct from user-initiated conversations. The user can switch into one to inspect what happened, or just glance at the activity feed for a one-line summary.
@@ -890,10 +890,14 @@ Orthogonal. Trust mode + Plan Mode = "I trust you to execute without per-tool co
 ### 12.1 Three modes
 
 - **Trust** (optional, autopilot): every tool class runs immediately. No confirmation cards. No blacklist. Users who opt into Trust accept the deal.
-- **Normal** (default): `read`-class tools run immediately; `write`, `exec`, and `ui` classes prompt the user. This is the default for new sessions.
-- **Strict**: every class including `read` prompts the user. For users who want to review every filesystem/process interaction.
+- **Normal** (default): `read`-class tools run immediately; `write` and `exec` classes prompt the user. `ui` class is pass-through (see below).
+- **Strict**: `read`, `write`, and `exec` classes all prompt the user. `ui` class is still pass-through (see below).
+
+**Why `ui` class is always pass-through**, regardless of mode: `ui` tools (namely `AskUserQuestion`) are **themselves** the user-interaction mechanism. The LLM calling `AskUserQuestion` already raises a user-facing card via the `question` SuspensionSpec path. Layering a permission prompt on top — "do you want to answer this question?" — is a double interruption with zero information value. Strict mode means "review every filesystem/process interaction", not "review the fact that the agent is about to ask you a question".
 
 Mode is per-session, initialized from the user's default in Preferences. The user can switch mid-session via a session-level toggle in the chief-chat UI.
+
+**Mode switch must clear the allowlist.** When the user switches a session's mode, the worker clears `session.allowOnceClasses` (and `session.singleUseApprovals` — see §12.2 for what these are) before persisting the new mode. This prevents the "I clicked Allow Always in Normal, then switched to Strict, and my allowlist bypassed Strict's intent" escape hatch. Changing modes is a deliberate action; the user is declaring a new policy and the old allowlist is no longer consented.
 
 The approval class of each tool is declared in the shared tool manifest (§6.3a, Rule 2). The interaction between mode and class is the truth table in §6.3a "Approval policy truth table" — not duplicated here.
 
@@ -908,8 +912,10 @@ function checkPermission(
   approvalClass: ApprovalClass,
   toolName: string,
   args: unknown,
-): 'allow' | 'deny' | 'prompt-needed'
+): 'allow' | 'prompt-needed'
 ```
+
+There are only two outcomes. `deny` is not a return value: the permission system does not maintain a denial cache. Every new tool call gets a fresh evaluation; if the user previously denied a call, the *resolved tool_result* for that call carries `{error: 'user-denied'}` in the history, and the LLM has to decide whether to try again (usually with different args or a different approach).
 
 Inputs the function reads (all from worker-side session state):
 
@@ -935,33 +941,35 @@ Why evaluation is in the worker, not main:
 - The hot path (read-class tools in trust or normal modes) is just a map lookup plus a truth-table check. An RPC round-trip for every Read/Glob/Grep call would measurably slow segments that fan out across many files.
 - State sync is cheap: main pushes mode changes via `set-permission-mode` and single-use additions via `stateUpdate` piggy-backed on `resolve-suspension` (§12.3). These are low-frequency events compared to tool calls.
 
-### 12.3 Approval flow (uniform — all classes, both prompt and suspend paths)
+### 12.3 Approval flow (uniform — all prompt-needed paths)
 
-All classes that need prompting go through the same flow. There is no "cautious-only" path anymore — the old §12.2 is superseded.
+When `checkPermission` returns `prompt-needed`, the tool call is suspended. The resolution path is:
 
-1. The worker tool wrapper for a gated tool calls `checkPermission(...)`.
-2. **allow** → wrapper proceeds. For `local` tools, it runs the inner executor. For `rpc` tools, it sends `rpc.request { kind: 'tool.exec' }` to main and awaits the response.
-3. **deny** → wrapper returns `{ error: 'user-denied' }` as the tool-result. (Deny is only produced by explicit user rejection of an earlier prompt whose outcome is still cached; in Phase 2a this path is only reached on re-emit after a denied suspension.)
-4. **prompt-needed** → wrapper:
+1. **Wrapper raises the suspension**:
    - generates `suspensionId = nanoid()`
    - pushes `SuspensionSpec { kind: 'permission', suspensionId, messageId, partIndex, toolCallId, toolName, approvalClass, summary, args }` onto `session.pendingSuspension`
    - writes a `part-append { type: 'tool-result', toolCallId, result: { __suspended: true, suspensionId } }` placeholder to the event log
    - throws `SuspensionSignal(suspensionId)`
-5. `runSegment` catches the signal, persists `suspension.json`, writes `message-finish`, returns `{reason: 'suspended'}`.
-6. Worker sends `suspension-raised { sessionId, spec }` to main.
-7. Main's `suspension-router` dispatches `permission.prompt { cardId, spec }` to the renderer. The renderer shows a PermissionCard with Allow / Allow Always (normal mode only) / Deny buttons.
-8. User clicks a button. Renderer sends `permission.respond { cardId, action }` to main.
-9. Main translates the action to a resolution and a state update, and sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to the worker:
+2. `runSegment` catches the signal, persists `suspension.json`, writes `message-finish`, returns `{reason: 'suspended'}`.
+3. Worker sends `suspension-raised { sessionId, spec }` to main.
+4. Main's `suspension-router` dispatches `permission.prompt { cardId, spec }` to the renderer. The renderer shows a PermissionCard with Allow / Allow Always (normal mode only; hidden in strict) / Deny buttons.
+5. User clicks a button. Renderer sends `permission.respond { cardId, action }` to main.
+6. Main translates the action to a resolution and a state update, and sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to the worker:
    - **Allow** → `resolution: { kind: 'permission-allow' }`, `stateUpdate: { addSingleUseKey }`
    - **Allow Always** → `resolution: { kind: 'permission-allow-always' }`, `stateUpdate: { addAllowOnceClass }`
    - **Deny** → `resolution: { kind: 'permission-deny' }`, no `stateUpdate`
-10. Worker applies `stateUpdate` (if present) **before** rewriting the placeholder. This ensures the next segment's `checkPermission` sees the new state.
-11. Worker emits a `part-update` replacing the `__suspended` placeholder with the resolved tool-result:
-    - Allow / Allow Always → `{ resolved: true }`
-    - Deny → `{ error: 'user-denied' }`
-12. Worker appends a synthetic user message describing the decision (e.g. `"[User allowed the previous Bash call]"`). This is what drives the LLM to re-emit the tool call (or not) on the next segment.
-13. Worker deletes `suspension.json`, clears `pendingSuspension`.
-14. Worker triggers a new `runLoop` iteration. If the LLM re-emits an Allow tool call with identical args, `checkPermission` hits the single-use key (or the allowlist) and the tool executes this time.
+7. Worker's resolution handler:
+   a. Applies `stateUpdate` (if present) — adds to `session.allowOnceClasses` or `session.singleUseApprovals`.
+   b. For **Allow** / **Allow Always**: **actually invokes the tool now**, outside of any `runSegment`. The wrapper synthesizes a fresh `ExecContext` using the session, the toolCallId from the SuspensionSpec, and a new `AbortController` tied to `session.currentAbortController`. It runs `inner(args, ctx)` for local tools, or sends `rpc.request { kind: 'tool.exec' }` to main for rpc tools. The return value is the real tool output (a string for Read, a `{stdout, stderr, exitCode}` for Bash, etc.). If the executor throws, it becomes `{error, hint?}`.
+   c. For **Deny**: skip tool execution. The resolved result is `{error: 'user-denied'}`.
+   d. Emits a single `part-update` replacing the `{__suspended: true}` placeholder with the resolved tool-result (the real tool output, or `{error: 'user-denied'}`).
+   e. Deletes `suspension.json`, clears `pendingSuspension`.
+8. Worker triggers a new `runLoop` iteration. The LLM sees a normal `tool_use → tool_result` pair in its history — the tool_result is either the real output or a user-denied error. **No synthetic user message is appended.** The Anthropic API requires that every `tool_use` be paired with exactly one `tool_result` (§15.5); the placeholder rewrite IS that tool_result. Appending an extra user message would violate the protocol.
+9. On the next segment, the LLM reads the history and decides its own next step: for Allow, the tool output is there and the LLM continues naturally; for Deny, it typically tries a different approach or asks the user why.
+
+**Protocol invariant**: at no point in this flow does the worker append a "synthetic user message" to record the resolution. The resolution is carried entirely by the rewritten tool_result, which is protocol-correct per the Anthropic Messages API.
+
+**Tool execution happens during resolution, not on the next segment.** This is a deliberate choice: executing on the next segment would require the LLM to re-emit an identical tool call, which is not guaranteed (the model may not re-emit, or may re-emit with slightly different args). Executing during resolution guarantees that one user "Allow" click produces exactly one tool execution.
 
 ### 12.4 Trust mode is honest
 
@@ -1333,21 +1341,36 @@ This is the section codex called out as missing. It is the single most important
 
 5. Worker receives resolve-suspension
    └─ Applies stateUpdate (if any) to session.allowOnceClasses /
-      session.singleUseApprovals BEFORE rewriting the placeholder
+      session.singleUseApprovals BEFORE executing the tool
    └─ Validates suspensionId matches session.pendingSuspension
-   └─ Computes the new tool-result content based on resolution kind
-        - plan-approved → { resolved: true, approved: true }
-        - plan-modified → { resolved: true, approved: true, modified: true }
-        - plan-rejected → { resolved: true, approved: false, reason }
-        - question-answered → { resolved: true, answer }
-        - permission-allow → { resolved: true }
-        - permission-allow-always → { resolved: true }
-        - permission-deny → { error: 'user-denied' }
-      (Phase 2a note: unlike the old 'cautious-allowed' path, permission-allow
-      does NOT re-invoke the underlying tool here. The LLM re-emits the tool
-      call on the next segment; the second attempt hits checkPermission with
-      the now-populated single-use key or allowlist, and the actual execution
-      happens then. See §12.3 steps 11–14 and Phase 2a spec §8.2.)
+   └─ Computes the new tool-result content based on resolution kind:
+        - plan-approved → synthetic user message path (see below), placeholder
+          rewrites to { resolved: true, approved: true }
+        - plan-modified → synthetic user message path, placeholder rewrites
+          to { resolved: true, approved: true, modified: true }
+        - plan-rejected → synthetic user message path, placeholder rewrites
+          to { resolved: true, approved: false, reason }
+        - question-answered → placeholder rewrites to
+          { resolved: true, answer }. No synthetic user message — the answer
+          is baked into the tool_result the LLM already paired with its
+          tool_use. (§12.3 protocol invariant.)
+        - permission-allow / permission-allow-always → the worker **invokes
+          the tool's real execute() now**, outside any runSegment, captures
+          the actual output (or error), and rewrites the placeholder to that
+          real output. No synthetic user message. (§12.3 step 7b.)
+        - permission-deny → placeholder rewrites to
+          { error: 'user-denied' }. No synthetic user message. (§12.3 step 7c.)
+
+   Note: Plan resolutions are the ONLY suspension kind that appends a
+   synthetic user message. Plans are a turn-level gate (the user says
+   "Proceed" or "Try again with X") and the synthetic user message is how
+   that instruction enters the conversation. Question and permission
+   resolutions carry their outcome in the rewritten tool_result and never
+   append an extra user message (doing so would violate the Anthropic
+   tool_use/tool_result pairing invariant).
+   └─ For permission-allow / permission-allow-always, invokes the tool's
+        real execute() now (see §12.3 step 7b) and captures its actual
+        output or error for use in the next step's rewrite.
    └─ Appends a `part-update` event keyed by (messageId, partIndex) from
         the saved suspension. Replay logic merges it into uiMessages so
         the placeholder is now the real tool-result. The tool_use_id is
@@ -1357,8 +1380,8 @@ This is the section codex called out as missing. It is the single most important
         `part-append` events for the synthetic USER message with the
         next instruction ("Plan approved. Proceed." / "Plan modified by
         user: <text>. Proceed." / "Plan rejected: <reason>. Please revise.")
-   └─ For question and cautious, no extra user message — the rewritten
-        tool-result is enough
+   └─ For question and permission resolutions, no extra user message — the
+        rewritten tool-result carries the entire outcome
    └─ Deletes suspension.json
    └─ Clears session.pendingSuspension
 
@@ -1717,7 +1740,7 @@ Skill system:
 
 Permission + Plan Mode:
 
-- [ ] Trust / Cautious mode switch (per-session)
+- [ ] Trust / Normal / Strict mode switch (per-session); mode change clears session allowlist
 - [ ] Cautious mode flows through suspension protocol (§12.2 + §15.5)
 - [ ] EnterPlanMode / ExitPlanMode tools
 - [ ] Plan Mode mask: removes Write/Edit/Bash/Cron*/Agent
@@ -1809,7 +1832,7 @@ Decisions to make before or during implementation:
 9. **What happens when the selected model doesn't support tool use?** (Some OpenRouter-listed models don't.) MVP: show a warning in the model picker and block selection. V1: disable tool-calling mode and fall back to text-only chat.
 10. **Concurrent segment cap (§15.4)**: 4 was a guess. Need to validate against (a) Anthropic's per-key rate limits, (b) realistic OneShip memory ceiling. May want to make it configurable in Preferences.
 11. **Cron-triggered session lifecycle**: do completed cron sessions stay in the Autonomous list forever, or auto-archive after N days? MVP: keep them all, manual delete. V1: auto-archive option.
-12. **Suspension on cron-only sessions**: §10.2 step 4 locks this in: cron-triggered sessions force `permissionMode='trust'` at creation (so Cautious never fires), and Plan/Ask suspensions end the segment as `error` with a notification in the activity feed. The user can later open the autonomous session and resolve the still-pending suspension manually. Open detail: should the cron auto-retry the next scheduled run if the previous one suspended unresolved, or should it skip until the user clears the block? Lean "skip" to avoid duplicate notifications.
+12. **Suspension on cron-only sessions**: §10.2 step 4 locks this in: cron-triggered sessions force `permissionMode='trust'` at creation (so permission prompts never fire), and Plan/Ask suspensions end the segment as `error` with a notification in the activity feed. The user can later open the autonomous session and resolve the still-pending suspension manually. Open detail: should the cron auto-retry the next scheduled run if the previous one suspended unresolved, or should it skip until the user clears the block? Lean "skip" to avoid duplicate notifications.
 13. **Multi-session sub-worker (§15.4 constraint)**: should heavy autonomous (cron) sessions run in a separate utilityProcess from the interactive worker, so a runaway cron can't block the user's interactive chat? V1 or V2 design question; MVP shares one worker.
 14. **Restart classification UX**: when the user opens a session whose `lastSegmentReason` is `aborted` or `error` due to an app crash, how loud is the notice? A gentle gray system message vs. a red banner. Lean gentle — crashes happen, we don't want to alarm the user every time.
 

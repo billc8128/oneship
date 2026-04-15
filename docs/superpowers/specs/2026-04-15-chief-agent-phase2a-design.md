@@ -58,7 +58,7 @@ Phase 2a is complete when **all six** of the following hold:
 Phase 2a tightens or clarifies the following points in the parent spec:
 
 1. **§6.3a is authoritative** for tool execution topology, descriptor schema, and approval-class semantics. Tool descriptors MUST declare `execution` and `approvalClass`; there is no context-dependent third mode. Security logic (path guards etc.) lives in `src/shared/tool-guards/`.
-2. **Permission is unified with the suspension protocol.** The parent spec §15.5 already puts permission on the suspension path ("cautious"); Phase 2a confirms this and rejects the alternative of a separate synchronous RPC for permission. Both `AskUserQuestion` and permission prompts raise a `SuspensionSpec`, end the segment, and resume via `resolve-suspension` + a synthetic user message.
+2. **Permission is unified with the suspension protocol.** The parent spec §15.5 already puts permission on the suspension path (historically "cautious"); Phase 2a confirms this and rejects the alternative of a separate synchronous RPC for permission. Both `AskUserQuestion` and permission prompts raise a `SuspensionSpec`, end the segment, and resume via `resolve-suspension` + a placeholder rewrite. **No synthetic user message is appended for question or permission resolutions** — the resolution is carried entirely by the rewritten `tool_result`, which is protocol-correct per the Anthropic tool_use/tool_result pairing invariant (§15.5). Only plan resolutions append a synthetic user message.
 3. **Permission check runs in the worker.** `checkPermission(mode, approvalClass, allowlist, singleUse)` is a pure function local to the worker. Main owns the policy source of truth (the default permission mode in Preferences, and the `set-permission-mode` IPC), but runtime evaluation happens where the tool is about to execute. This keeps the worker from having to round-trip to main on every `read`-class tool call in trust/normal modes (which is the common case).
 4. **Permission mode is widened from two values to three.** Parent spec §12.1 and §15.1 define `PermissionMode = 'trust' | 'cautious'`, and Phase 1 ships that exact type in `src/shared/agent-protocol.ts:36`. Phase 2a replaces it with `PermissionMode = 'trust' | 'normal' | 'strict'`. The rename is intentional: "cautious" was a single mode doing two jobs (prompt for write/exec, which `normal` now does; prompt for everything, which `strict` now does). The parent spec's §12.2 "cautious approval flow" is **retired and superseded by §8** of this document. Phase 2a plan must: widen the `PermissionMode` type in `src/shared/agent-protocol.ts`, retire any remaining `'cautious'` string literals, update the parent spec §12 to point at §8, and migrate any in-flight session meta.json that still carries `'cautious'` — Phase 1 hardcodes `'trust'` on session creation and never writes `'cautious'`, so no disk migration is required, only code migration.
 5. **Event log stays at four event types; `part-update` does all placeholder rewrites and text-buffer flushes.** Parent spec §15.2.1 explicitly reserves `part-update` for "tool-result placeholder rewrites" and §15.2.3 explicitly names `part-update` as the event that gets batched for streaming text. Phase 1 already exports the `part-update` schema in `src/agent/services/event-log.ts` and already handles it in `replay()` in `src/agent/services/conversation-store.ts` with the exact bounds check Phase 2a needs. Phase 2a implements `writePartUpdate` (which Phase 1 stubs as `Phase1NotImplemented`) and uses it for both text-delta flushes and suspension-resolved placeholder rewrites. No new event type is introduced.
@@ -88,7 +88,11 @@ Phase 2a tightens or clarifies the following points in the parent spec:
    - **prompt-needed**: push a `permission` SuspensionSpec to `session.pendingSuspension`, write a `{__suspended: true}` placeholder tool-result, throw `SuspensionSignal`. `runSegment` catches the signal, persists `suspension.json`, and returns `{ reason: 'suspended' }`.
 5. **Suspending tools (AskUserQuestion).** `AskUserQuestion` is `execution: 'local'`, `approvalClass: 'ui'` per the parent spec §6.3a assignment (updated 2026-04-15). It is a worker-side control-flow tool, colocated with other suspending tools. When the LLM invokes it, the wrapper pushes a `{ kind: 'question' }` SuspensionSpec onto `session.pendingSuspension`, writes a `{__suspended: true}` placeholder via `part-append`, and throws `SuspensionSignal`. `runSegment` catches the signal and ends the segment through the same code path as permission suspensions. Main's `suspension-router` receives the `suspension-raised` IPC and dispatches `ask.prompt` to the renderer for UI mediation — main is never the executor of the tool, only the host of the card.
 6. **runLoop follows finish reason.** `tool-calls` → continue to next segment. Anything else → persist `lastSegmentReason` and return.
-7. **Suspension resolution.** Main's `suspension-router` receives `suspension-raised`, looks at `spec.kind`, dispatches `permission.prompt` or `ask.prompt` to the renderer. Renderer shows the appropriate card. User action → `resolve-suspension` IPC back to main → main updates session state (allowlist additions, singleUseApproval entries) → main forwards `resolve-suspension` to worker → worker emits a `part-update` event to replace the `__suspended` placeholder tool-result with its resolved value, appends a synthetic user message to the session history describing the resolution, deletes `suspension.json`, and clears `pendingSuspension` → worker triggers a new `runLoop` iteration. (`cleanupOrphanPlaceholders` is a separate safety net for orphans from crashed sessions; see §9.2 — it does NOT perform the happy-path rewrite.)
+7. **Suspension resolution.** Main's `suspension-router` receives `suspension-raised`, looks at `spec.kind`, dispatches `permission.prompt` or `ask.prompt` to the renderer. Renderer shows the appropriate card. User action → `resolve-suspension` IPC back to main → main builds the resolution + optional `stateUpdate` → main forwards `resolve-suspension` to worker → worker's resolution handler applies `stateUpdate`, then:
+   - For **question-answered**: emits a `part-update` rewriting the `__suspended` placeholder to `{resolved: true, answer}`.
+   - For **permission-allow / permission-allow-always**: **invokes the tool's real `execute(args)` now**, outside any `runSegment`, using a synthesized `ExecContext`. Captures the real output. Emits a `part-update` rewriting the placeholder to the actual tool output (or `{error, hint?}` if the executor throws).
+   - For **permission-deny**: emits a `part-update` rewriting the placeholder to `{error: 'user-denied'}`.
+   Worker deletes `suspension.json`, clears `pendingSuspension`, then triggers a new `runLoop` iteration. No synthetic user message is appended in any of these paths. (`cleanupOrphanPlaceholders` is a separate safety net for orphans from crashed sessions; see §9.2 — it does NOT perform the happy-path rewrite.)
 
 ### 5.2 Deferred decisions (flagged not designed)
 
@@ -150,7 +154,7 @@ Rules:
 - **Success** — the tool's inner `execute(args)` returns whatever the tool naturally produces (a string for `Read`, a `{stdout, stderr, exitCode}` object for `Bash`, an array for `Glob`, etc.). The wrapper in §6.2 passes this through unchanged; no envelope is added. The LLM sees the natural shape, as it would with any Claude Code tool.
 - **Error** — the wrapper catches any thrown error (or intercepts pre-execution guard rejections) and returns `{error: <code>, hint?: <detail>}`. The `error` field is a stable short code; `hint` is optional freeform context (stdout tail, file path, etc.).
 - **Suspended** — the wrapper sets `{__suspended: true, suspensionId}` as the placeholder tool-result BEFORE throwing `SuspensionSignal`. This is written to the event log via `part-append`, then later replaced via `part-update` when the suspension resolves.
-- **Resolved** — when the explicit §8.2 step 12 rewrite runs, it emits a `part-update` replacing the placeholder with `{resolved: true, answer?: <string>}`. This is the post-resolution marker the LLM sees for a question or permission-allow. (For permission-allow the LLM doesn't actually need the `resolved` marker because the subsequent synthetic user message tells it to re-emit; but the marker is harmless and makes the event log self-describing.)
+- **Resolved** — used only for `question-answered` resolutions. Emits a `part-update` replacing the placeholder with `{resolved: true, answer: <string>}`. The LLM sees the answer inside the tool_result, which is protocol-correct per Anthropic's tool_use/tool_result pairing invariant. Permission-allow resolutions do NOT use this shape — they rewrite to the real tool output (see §8.2 step 7). Permission-deny rewrites to `{error: 'user-denied'}`.
 
 **Disambiguation guarantee**: a tool's natural success payload MUST NOT have any top-level key named `__suspended`, `resolved`, or `error`. For Phase 2a's eight tools this is trivially true (none have such keys). A lint/test rule is added that rejects any new tool whose manifest-defined output schema includes one of these reserved keys at top level. This preserves the "success = anything not matching a discriminator" invariant without a wrapper.
 
@@ -193,11 +197,8 @@ export function wrapLocalTool(
         }
       }
 
-      if (decision === 'deny') {
-        return { error: 'user-denied' }
-      }
-
-      // decision === 'prompt-needed' — raise a permission suspension
+      // decision === 'prompt-needed' — raise a permission suspension.
+      // (There is no 'deny' return from checkPermission; §12.2 / §8.1.)
       const suspensionId = nanoid()
       session.pendingSuspension = {
         kind: 'permission',
@@ -399,8 +400,11 @@ export function checkPermission(
   approvalClass: ApprovalClass,
   toolName: string,
   args: unknown,
-): 'allow' | 'deny' | 'prompt-needed' {
-  if (approvalClass === 'ui') return 'allow'   // pass-through
+): 'allow' | 'prompt-needed' {
+  // Pass-through for ui class, regardless of mode. AskUserQuestion is
+  // ALREADY a user-interaction mechanism — layering a permission prompt on
+  // top is a double interruption with zero information value. See §12.1.
+  if (approvalClass === 'ui') return 'allow'
 
   const mode = session.meta.permissionMode
   if (mode === 'trust') return 'allow'
@@ -424,6 +428,8 @@ export function singleUseKey(toolName: string, args: unknown): string {
 }
 ```
 
+**No `deny` return value.** The permission system does not maintain a denial cache in Phase 2a. When a user denies a permission prompt, the resolved tool_result (rewritten from the `__suspended` placeholder) carries `{error: 'user-denied'}` — the LLM sees this in its next segment's history and decides how to react. A subsequent identical tool call would trigger a fresh permission prompt. YAGNI: single-use deny tokens would require a new data structure and a new UI button, and Phase 2a has no feature that needs them.
+
 `session.allowOnceClasses: Set<ApprovalClass>` — persists per runtime session, not persisted to disk.
 `session.singleUseApprovals: Set<string>` — single-use tokens keyed by `toolName:argsHash`; consumed on hit.
 
@@ -437,25 +443,30 @@ When `checkPermission` returns `prompt-needed`:
 4. `runSegment` catches → persists `suspension.json` → appends `message-finish` → returns `{reason: 'suspended'}`.
 5. Worker sends `suspension-raised` IPC to main.
 6. Main's `suspension-router` dispatches `permission.prompt` to renderer with the card payload.
-7. Renderer shows PermissionCard; user clicks Allow / Allow Always / Deny.
+7. Renderer shows PermissionCard; user clicks Allow / Allow Always (normal mode only, hidden in strict) / Deny.
 8. Renderer sends `permission.respond { cardId, action }` to main.
-9. Main decides what state update the worker needs to apply and attaches it to the `resolve-suspension` IPC payload (§12). State updates piggy-back on the resolution message; no separate IPC is used. Specifically:
-   - **Allow**: attach `stateUpdate: { addSingleUseKey: '<toolName>:<argsHash>' }` — the worker applies this to `session.singleUseApprovals` atomically with the resolution.
-   - **Allow Always** (normal mode only, button hidden in strict): attach `stateUpdate: { addAllowOnceClass: <approvalClass> }` — the worker applies this to `session.allowOnceClasses`.
-   - **Deny**: no `stateUpdate` field.
-10. Main sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to worker. Worker applies `stateUpdate` (if present) **before** rewriting the placeholder, so that the next segment's `checkPermission` sees the updated state from the very first tool call.
-11. Worker appends a synthetic user message to the session: `"[User decision on prior tool call: allow|deny]"`. (Plan task will finalize exact wording; the key constraint is that the LLM sees a normal user turn, not an assistant correction.)
-12. Worker emits a single `part-update` event that replaces the `{__suspended: true, suspensionId}` tool-result placeholder at its known `(messageId, partIndex)` with the resolved value: `{resolved: true, answer: '...'}` for questions, `{resolved: true}` for permission-allow, or `{error: 'user-denied'}` for permission-deny. This explicit rewrite owns the happy-path transition. `cleanupOrphanPlaceholders` is NOT called here — see §9.2 for the invariant.
-13. Worker deletes `suspension.json`, clears `pendingSuspension`.
-14. Worker triggers a new `runLoop` iteration. The LLM is now free to re-emit the same tool call, a modified tool call, or a different tool call entirely — the model makes its own decision based on what the synthetic user message tells it.
-    - If the LLM re-emits **byte-identical args** and resolution was `permission-allow`, `checkPermission` hits the `singleUseApprovals` entry (consumed on hit) and the tool executes.
-    - If the LLM re-emits with **any difference in args** (whitespace, reordering, partial edit), the single-use key misses and a fresh permission prompt is raised. This is the intended safe behavior — see §8.3. A plan writer reading this section MUST NOT assume the re-emit is guaranteed; the test cases in §14.1 item 4 validate the identical-args path and item 5 validates the allow-always path where arg differences don't matter.
-    - If resolution was `permission-allow-always`, the approvalClass is in `allowOnceClasses`, so any subsequent tool call of the same class (identical args or not) passes `checkPermission` without further prompts.
-    - If resolution was `permission-deny`, the LLM sees `{error: 'user-denied'}` in history and typically chooses a different approach; no auto-retry is attempted by runLoop.
+9. Main builds the resolution + optional `stateUpdate` and sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to worker:
+   - **Allow** → `resolution: { kind: 'permission-allow' }`, no `stateUpdate` needed (the tool will be executed during resolution, so no need to cache an allow for "next time").
+   - **Allow Always** → `resolution: { kind: 'permission-allow-always' }`, `stateUpdate: { addAllowOnceClass: <approvalClass> }`.
+   - **Deny** → `resolution: { kind: 'permission-deny' }`, no `stateUpdate`.
 
-### 8.3 Single-use approval key collisions
+   Note: `singleUseApprovals` is no longer used in the Allow flow under the current design — because the tool runs **during** resolution (step 10 below), there's no "next tool call" that needs a cached allow. `singleUseApprovals` remains in `checkPermission` only as an escape hatch for scenarios that send a stateUpdate for some reason (none in Phase 2a); the set will usually be empty.
 
-`singleUseKey(toolName, args)` uses a stable JSON serialization of args. If the LLM re-emits a tool call with identical args, the key hits once and is then consumed. If the LLM re-emits with slightly different args (e.g., different surrounding whitespace), the key misses and a new prompt is raised — this is the safe behavior.
+10. Worker's **resolution handler** (not in any `runSegment`):
+    a. Applies `stateUpdate` (if present) — adds `approvalClass` to `session.allowOnceClasses`.
+    b. Builds the resolved tool_result according to the resolution kind:
+       - **permission-allow / permission-allow-always**: synthesizes an `ExecContext` using the session, the toolCallId from the SuspensionSpec, and a new `AbortController` tied to `session.currentAbortController`. **Invokes the tool's real executor** — for `execution: 'local'` tools, calls the inner function directly; for `execution: 'rpc'` tools, sends `rpc.request { kind: 'tool.exec' }` to main and awaits the response. The resolved tool_result is the real output on success, or `{error, hint?}` on failure (the wrapper's normal error path, see §6.2). **The guard check (path-guard etc.) still runs** — the resolution handler reuses the same `wrap*Tool`-style preamble to ensure the deferred execution gets the same safety checks as a regular invocation.
+       - **permission-deny**: resolved tool_result is `{error: 'user-denied'}`.
+    c. Emits a single `part-update` event at the placeholder's known `(messageId, partIndex)`, replacing `{__suspended: true, ...}` with the resolved tool_result.
+    d. Deletes `suspension.json`, clears `pendingSuspension`.
+11. Worker triggers a new `runLoop` iteration. The LLM's history now contains a normal `tool_use → tool_result` pair: either the real tool output (Allow / Allow Always) or `{error: 'user-denied'}` (Deny). **No synthetic user message is appended.** The Anthropic Messages API requires exactly one `tool_result` for each `tool_use`; the rewrite IS that `tool_result`, and appending a user message would violate the pairing invariant (parent spec §15.5).
+12. On the next segment, the LLM decides what to do based entirely on the rewritten tool_result. For Allow, it sees the real output and continues. For Deny, it sees the error and typically chooses a different approach.
+
+**Tool execution happens during resolution, not on a subsequent re-emit.** This is a deliberate choice: relying on the LLM to re-emit an identical tool call is fragile (it may re-emit with different args, or not re-emit at all). Executing during resolution guarantees that one user "Allow" click produces exactly one tool execution.
+
+### 8.3 Single-use approval key — reserved for forward compat
+
+`singleUseKey(toolName, args)` uses a stable JSON serialization of args to produce a deterministic per-call key. Phase 2a does not use this mechanism on the Allow path (Allow executes the tool immediately during resolution — see §8.2 step 10b — so there's no "next call" to cache for). The helper is kept in `check-permission.ts` and consulted on every call because a future scenario (Phase 2b+) may want to pre-approve an upcoming call without executing it yet. For Phase 2a the set is always empty in practice; `checkPermission`'s rule 4 is exercised only by the unit tests (§14.1).
 
 ### 8.4 Mode switching mid-session
 
@@ -465,7 +476,7 @@ User can change permission mode on a session at any time via the UI. The IPC pat
 renderer → main (set-permission-mode { sessionId, mode }) → worker
 ```
 
-Worker updates `session.meta.permissionMode`, persists meta.json, and clears `session.allowOnceClasses` (not `singleUseApprovals` — those are per-approved-action and shouldn't be invalidated by a mode change).
+Worker updates `session.meta.permissionMode`, persists meta.json, and **clears both `session.allowOnceClasses` and `session.singleUseApprovals`**. Reason: changing the mode is the user declaring a new policy. The old allowlist was consented under the old mode; carrying it into the new mode creates a bypass (e.g., "I clicked Allow Always for exec in Normal, then switched to Strict — my Strict session silently allows exec without prompting"). Clearing both sets on every mode change makes the policy change deterministic and matches §12.1 of the parent spec.
 
 ## 9. Suspension Framework
 
@@ -729,12 +740,12 @@ Mock Vercel AI SDK `streamText` to return a controllable async iterator. Cover a
 
 1. **Natural finish**: text-delta events → finish with reason='stop' → segment returns natural.
 2. **Tool call happy path**: text-delta → tool-call → local tool executes → tool-result → more text → finish='tool-calls' → runLoop continues → next segment finishes natural.
-3. **Permission prompt → deny → resumed segment**: tool-call → checkPermission returns prompt-needed → SuspensionSignal → runSegment returns suspended → resolve-suspension 'permission-deny' → explicit `part-update` rewrites placeholder to `{error: 'user-denied'}` → synthetic user message appended → new runLoop iteration → next segment returns natural without re-trying the tool.
-4. **Permission prompt → allow → resumed segment re-emits tool call → tool actually executes**: like (3) but resolution is `permission-allow` → singleUseApprovals gets the key → new segment → LLM re-emits identical tool call → checkPermission hits singleUse → returns allow → inner executor runs → tool-result real value. This is the most subtle path in the whole spec; it validates the single-use consumption AND the synthetic-user-message-triggers-re-emit round-trip.
-5. **Permission prompt → allow-always → two subsequent tool calls of same class run without prompting**: resolution is `permission-allow-always` → allowOnceClasses gets the approvalClass → next segment's first tool call hits allowlist, runs without SuspensionSignal → second tool call of same class also runs without SuspensionSignal.
-6. **Suspension raised by AskUserQuestion**: same flow but `kind: 'question'`; resolution is `question-answered`; the happy-path explicit `part-update` replaces the placeholder with `{resolved: true, answer: '...'}`.
+3. **Permission prompt → deny**: tool-call → checkPermission returns prompt-needed → SuspensionSignal → runSegment returns suspended → resolve-suspension 'permission-deny' → resolution handler rewrites placeholder to `{error: 'user-denied'}` via `part-update` → new runLoop iteration → next segment's history shows the denial tool_result → LLM returns natural without re-trying the tool. **No synthetic user message in the history** — assert this explicitly.
+4. **Permission prompt → allow → tool executes during resolution**: tool-call (e.g. `Write('/tmp/x', 'hello')`) → checkPermission returns prompt-needed → SuspensionSignal → runSegment returns suspended → resolve-suspension 'permission-allow' → **resolution handler invokes the real `Write` executor outside any `runSegment`**, file gets written → resolution handler emits `part-update` replacing placeholder with the real tool output → new runLoop iteration → next segment's history shows a normal tool_use→tool_result pair → LLM continues naturally. This is the core allow-path test; assert that the file exists, that the event log contains exactly one `part-update` for the placeholder (not two, not zero), and that no synthetic user message was appended.
+5. **Permission prompt → allow-always → tool executes during resolution → subsequent same-class tool run without prompting**: resolution is `permission-allow-always` → allowOnceClasses gains `'write'` → resolution handler invokes first `Write`, rewrites placeholder → next segment hits a second `Write` call → checkPermission sees allowlist and returns allow without prompting → second Write executes in-segment.
+6. **Suspension raised by AskUserQuestion**: control-flow tool raises `kind: 'question'` suspension → resolve-suspension 'question-answered' → resolution handler rewrites placeholder to `{resolved: true, answer: '...'}` via `part-update` → no tool execution, no synthetic user message → new runLoop iteration → LLM sees the answer in the tool_result.
 7. **External abort mid-stream**: runSegment mid-stream → externalAbort.abort() → returns aborted.
-8. **Cancel during suspension**: runSegment suspended → externalAbort.abort() arrives before user responds → permission card is cancelled → session returns to idle with synthetic "[User cancelled]" user message.
+8. **Cancel during suspension**: session is suspended (placeholder in history, `suspension.json` on disk) → `cancel-current-turn` IPC arrives before user responds → main sends `permission.cancel` to renderer (removes the card) → main sends a synthetic `resolve-suspension` with kind `permission-deny` to worker → resolution handler rewrites placeholder to `{error: 'user-cancelled'}` → session returns to idle. (Cancel-during-suspension is the ONE case where main synthesizes a resolution on the user's behalf; the error code is `'user-cancelled'` not `'user-denied'` so the LLM knows the call was interrupted, not rejected.)
 9. **Retryable error (429) succeeds on second attempt**: streamText throws 429 → retry layer backoff 200ms → second attempt returns normal finish.
 10. **Retry exhaustion**: streamText throws 429 three times in a row → retry layer gives up → returns `{reason: 'error', error: 'rate-limited'}`.
 11. **Non-retryable error (401)**: streamText throws 401 → returns error immediately without retry → error message includes sanitized "invalid API key".
@@ -877,9 +888,9 @@ Acceptance: `grep -rn "Phase1NotImplemented\|appendAssistantStubReply" src/` ret
 ## 17. Open Questions (must be resolved during plan writing)
 
 1. Does `TerminalManager` already have a one-shot exec API? (§11.4 decision)
-2. What exact wording does the synthetic user message take for each resolution kind? (§8.2 step 12)
-3. Is `/tmp` the right "allowed outside workspace" path, or should it be more restrictive? (§6.4 decision)
-4. Should the Preferences panel require an API key before enabling Chief Agent at all, or allow a read-only "no key configured" state? (UX decision)
+2. Is `/tmp` the right "allowed outside workspace" path, or should it be more restrictive? (§6.4 decision)
+3. Should the Preferences panel require an API key before enabling Chief Agent at all, or allow a read-only "no key configured" state? (UX decision)
+4. Plan resolutions DO append synthetic user messages (§12.3 in parent spec). Phase 2a doesn't implement plan mode but its IPC protocol union includes the plan resolution kinds. The plan task should verify the SuspensionResolution union shape matches the parent spec's §15.5 step 5 and that the plan-specific branches throw `Phase2bNotImplemented` cleanly.
 
 ## 18. References
 
