@@ -11,4 +11,9 @@ describe('global renderer styles', () => {
     expect(globalsCss).toContain('padding-right:')
     expect(globalsCss).toContain('scrollbar-gutter: stable;')
   })
+
+  it('overrides xterm viewport black fill so the scrollbar gutter matches the active terminal background', () => {
+    expect(globalsCss).toContain('.xterm .xterm-viewport {')
+    expect(globalsCss).toContain('background-color: transparent;')
+  })
 })
