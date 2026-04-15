@@ -833,6 +833,12 @@ describe('Session Phase 2a in-memory state', () => {
     expect(session.currentResolutionAbortController).toBeNull()
   })
 
+  it('exposes eventLogPath as a getter that returns the right path for the session', async () => {
+    const session = await Session.create({ sessionId: 's_state3b' })
+    expect(session.eventLogPath).toContain('s_state3b')
+    expect(session.eventLogPath).toContain('events.jsonl')
+  })
+
   it('setPermissionMode clears allowOnceClasses and singleUseApprovals', async () => {
     // Phase 2a §8.4: switching modes is a deliberate policy change. The
     // old allowlist was consented under the old mode and is no longer
@@ -882,11 +888,21 @@ public currentResolutionAbortController: AbortController | null = null
 // writing into. Cleared in endAssistantMessage().
 public currentMessageId: string | null = null
 public currentPartIndex: number = -1
+
+// Phase 1 calls eventLogPath(this.meta.sessionId) as a free function
+// from ./store at every site. Phase 2a's helpers (appendToolCallPart,
+// appendPlaceholderToolResult, rewriteToolResultPart, appendTextPart,
+// rewriteTextPart, etc.) all need the same path, so expose it as a
+// getter to avoid threading the import through every helper.
+get eventLogPath(): string {
+  return computeEventLogPath(this.meta.sessionId)
+}
 ```
 
-Add the imports at the top of the file:
+Add the imports at the top of the file. Note the alias for the `eventLogPath` import — without it the local getter shadows the imported function:
 
 ```ts
+import { eventLogPath as computeEventLogPath } from './store'
 import type { ApprovalClass, PermissionMode, SuspensionSpec } from '../../shared/agent-protocol'
 ```
 
@@ -1911,11 +1927,30 @@ Also remove the `Phase1NotImplemented` class definition — the resolution handl
 
 Actually, **leave `Phase1NotImplemented` in place** for Task 16 to delete in one sweep. Just replace `writePartUpdate`'s body, don't touch the class definition yet.
 
-- [ ] **Step 3: Add `appendPlaceholderToolResult` and `appendToolCallPart` helpers to Session**
+- [ ] **Step 3: Add the full set of Phase 2a Session write helpers**
 
-Edit `src/agent/session/session.ts`. Add methods (location: near other write helpers):
+Edit `src/agent/session/session.ts`. Add **all six** new methods that Phase 2a needs (Task 11b will call `appendTextPart`, Task 13's `runSegment` will call all of them — defining them here keeps the Session API atomic).
 
 ```ts
+async beginAssistantMessage(): Promise<string> {
+  const messageId = `msg_${nanoid()}`
+  await writeMessageStart(this.eventLogPath, this.uiMessages, {
+    messageId,
+    role: 'assistant',
+    createdAt: Date.now(),
+  })
+  this.currentMessageId = messageId
+  this.currentPartIndex = -1   // -1 because next append will become index 0
+  return messageId
+}
+
+async endAssistantMessage(): Promise<void> {
+  if (!this.currentMessageId) return
+  await writeMessageFinish(this.eventLogPath, this.uiMessages, { messageId: this.currentMessageId })
+  this.currentMessageId = null
+  this.currentPartIndex = -1
+}
+
 async appendToolCallPart(args: { toolCallId: string; toolName: string; toolArgs: unknown }): Promise<void> {
   if (!this.currentMessageId) throw new Error('no current message')
   await writePartAppend(this.eventLogPath, this.uiMessages, {
@@ -1933,21 +1968,23 @@ async appendPlaceholderToolResult(args: { messageId: string; toolCallId: string;
   this.currentPartIndex++
 }
 
-async rewriteToolResultPart(args: { messageId: string; partIndex: number; result: unknown }): Promise<void> {
+async appendTextPart(args: { text: string }): Promise<void> {
+  if (!this.currentMessageId) throw new Error('no current message')
+  await writePartAppend(this.eventLogPath, this.uiMessages, {
+    messageId: this.currentMessageId,
+    part: { type: 'text', text: args.text } as any,
+  })
+  this.currentPartIndex++
+}
+
+async rewriteTextPart(args: { messageId: string; partIndex: number; text: string }): Promise<void> {
   await writePartUpdate(this.eventLogPath, this.uiMessages, {
     messageId: args.messageId,
     partIndex: args.partIndex,
-    part: { type: 'tool-result', toolCallId: '', result: args.result } as any,
+    part: { type: 'text', text: args.text } as any,
   })
-  // Note: toolCallId is preserved by reading the existing part; in a real
-  // implementation we'd look it up. For Phase 2a's first cut the
-  // placeholder→resolved rewrite just replaces .result.
 }
-```
 
-The `rewriteToolResultPart` API is intentionally minimal — it preserves the structural address `(messageId, partIndex)` and replaces the result payload. The `toolCallId` field needs to come from the existing part; refine in a follow-up if `writePartUpdate`'s shape requires the full part. For now, look up the existing part:
-
-```ts
 async rewriteToolResultPart(args: { messageId: string; partIndex: number; result: unknown }): Promise<void> {
   const msg = this.uiMessages.find((m) => m.id === args.messageId)
   if (!msg) throw new Error(`rewriteToolResultPart: message ${args.messageId} not found`)
@@ -1955,7 +1992,7 @@ async rewriteToolResultPart(args: { messageId: string; partIndex: number; result
   if (!existing || (existing as any).type !== 'tool-result') {
     throw new Error(`rewriteToolResultPart: not a tool-result at ${args.messageId}[${args.partIndex}]`)
   }
-  const rewritten = { ...existing, result: args.result }
+  const rewritten = { ...existing, result: args.result } as any
   await writePartUpdate(this.eventLogPath, this.uiMessages, {
     messageId: args.messageId,
     partIndex: args.partIndex,
@@ -1964,7 +2001,9 @@ async rewriteToolResultPart(args: { messageId: string; partIndex: number; result
 }
 ```
 
-Make sure `writePartAppend` and `writePartUpdate` are imported from `../services/conversation-store`.
+Make sure `writeMessageStart`, `writeMessageFinish`, `writePartAppend`, `writePartUpdate` are imported from `../services/conversation-store`, and `nanoid` from `'nanoid'`.
+
+Note that Task 13 (runSegment) will reference all of these helpers and will NOT redefine them. The Task 13 step "Add the missing Session helpers" then becomes a no-op verification step.
 
 - [ ] **Step 4: Write a failing test for resolution-handler**
 
@@ -2086,29 +2125,9 @@ describe('cancelSuspendedCard', () => {
 pnpm test src/agent/session/__tests__/resolution-handler.test.ts
 ```
 
-Expected: cannot find module + need `Session.beginAssistantMessage`.
+Expected: cannot find module './resolution-handler'. (The Session helpers — `beginAssistantMessage`, `appendToolCallPart`, `appendPlaceholderToolResult`, `rewriteToolResultPart` — were all added in Step 3 above and are already present.)
 
-- [ ] **Step 6: Add `beginAssistantMessage` to Session**
-
-In `src/agent/session/session.ts`:
-
-```ts
-async beginAssistantMessage(): Promise<string> {
-  const messageId = `msg_${nanoid()}`
-  await writeMessageStart(this.eventLogPath, this.uiMessages, {
-    messageId,
-    role: 'assistant',
-    createdAt: Date.now(),
-  })
-  this.currentMessageId = messageId
-  this.currentPartIndex = -1   // -1 because next append will become index 0
-  return messageId
-}
-```
-
-Make sure to expose `currentMessageId: string | null = null` and `currentPartIndex: number = -1` as fields on the Session class.
-
-- [ ] **Step 7: Implement resolution-handler.ts**
+- [ ] **Step 6: Implement resolution-handler.ts**
 
 Create `src/agent/session/resolution-handler.ts`:
 
@@ -2294,7 +2313,7 @@ suspensionPath(): string {
 }
 ```
 
-- [ ] **Step 8: Run test to verify it passes**
+- [ ] **Step 7: Run test to verify it passes**
 
 ```bash
 pnpm test src/agent/session/__tests__/resolution-handler.test.ts
@@ -2302,7 +2321,7 @@ pnpm test src/agent/session/__tests__/resolution-handler.test.ts
 
 Expected: 5 tests pass.
 
-- [ ] **Step 9: Run full suite**
+- [ ] **Step 8: Run full suite**
 
 ```bash
 pnpm test
@@ -2310,7 +2329,7 @@ pnpm test
 
 Expected: no regressions.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/agent/session/session.ts src/agent/session/resolution-handler.ts src/agent/session/__tests__/resolution-handler.test.ts src/agent/services/conversation-store.ts
@@ -3032,7 +3051,7 @@ export async function runSegment(
         tools: buildTools(),
         stopWhen: stepCountIs(STEP_CAP),
         abortSignal: externalAbort,
-        experimental_context: { session, projectRoot: session.projectRoot ?? process.cwd() },
+        experimental_context: { session, projectRoot: session.projectRoot },
       })
     })
 
@@ -3112,37 +3131,13 @@ function buildTools() {
 }
 ```
 
-The Session needs new helpers — `appendTextPart`, `rewriteTextPart`, `endAssistantMessage`, `persistSuspension`, `toCoreMessages`, `projectRoot`. Add stubs for whichever Phase 1 hasn't already provided.
+Most Session helpers (`beginAssistantMessage`, `endAssistantMessage`, `appendToolCallPart`, `appendPlaceholderToolResult`, `appendTextPart`, `rewriteTextPart`, `rewriteToolResultPart`, `eventLogPath` getter) are already added in Task 10 Step 3. Task 13 only needs the streaming-path-specific helpers that Task 10 didn't need: `persistSuspension`, `toCoreMessages`, and the `projectRoot` getter.
 
-- [ ] **Step 3: Add the missing Session helpers**
+- [ ] **Step 3: Add the streaming-only Session helpers**
 
 Edit `src/agent/session/session.ts` to add:
 
 ```ts
-async appendTextPart(args: { text: string }): Promise<void> {
-  if (!this.currentMessageId) throw new Error('no current message')
-  await writePartAppend(this.eventLogPath, this.uiMessages, {
-    messageId: this.currentMessageId,
-    part: { type: 'text', text: args.text } as any,
-  })
-  this.currentPartIndex++
-}
-
-async rewriteTextPart(args: { messageId: string; partIndex: number; text: string }): Promise<void> {
-  await writePartUpdate(this.eventLogPath, this.uiMessages, {
-    messageId: args.messageId,
-    partIndex: args.partIndex,
-    part: { type: 'text', text: args.text } as any,
-  })
-}
-
-async endAssistantMessage(): Promise<void> {
-  if (!this.currentMessageId) return
-  await writeMessageFinish(this.eventLogPath, this.uiMessages, { messageId: this.currentMessageId })
-  this.currentMessageId = null
-  this.currentPartIndex = -1
-}
-
 async persistSuspension(): Promise<void> {
   if (!this.pendingSuspension) return
   const path = this.suspensionPath()
@@ -3167,11 +3162,12 @@ get projectRoot(): string {
 }
 ```
 
-Add the imports at the top of session.ts:
+Add the imports at the top of session.ts (if not already present from Task 10):
 
 ```ts
 import { convertToModelMessages, type ModelMessage } from 'ai'
 import { homedir } from 'node:os'
+import { promises as fs } from 'node:fs'
 ```
 
 - [ ] **Step 4: Implement run-loop.ts**
@@ -3346,10 +3342,42 @@ git commit -m "feat(runtime): runSegment + runLoop + system-prompt + Session hel
 **Spec:** Phase 2a §14.1 (full 18-test list)
 
 **Files:**
+- Modify: `src/agent/runtime/run-segment.ts` (add the parallel-suspension collision check in the catch block — Step 0 below)
 - Modify: `src/agent/runtime/__tests__/run-segment.test.ts` (extend)
 - Modify: `src/agent/runtime/__tests__/run-loop.test.ts` (extend, create if absent)
 
 Task 13 wrote 5 tests (1, 13, 14, 16, 17). This task adds the remaining 13 + the parallel-suspension invariant (test 18). Each test extends the existing file with mock-streamText harness already established in Task 13.
+
+- [ ] **Step 0: Add the parallel-suspension collision check to runSegment**
+
+Edit `src/agent/runtime/run-segment.ts`. Find the existing `catch (err)` block and update the `if (err instanceof SuspensionSignal)` branch:
+
+```ts
+if (err instanceof SuspensionSignal) {
+  // Parallel-suspension invariant (Phase 2a §14.1 test 18, parent §15.5):
+  // if a second SuspensionSignal arrived after the first one already set
+  // pendingSuspension, the runtime cannot honor both. Phase 2b will use
+  // the deferredSuspensions queue from parent §15.5; Phase 2a returns
+  // an error so the collision is loud.
+  if (
+    session.pendingSuspension &&
+    session.pendingSuspension.suspensionId !== err.suspensionId
+  ) {
+    await flusher.finalFlush().catch(() => {})
+    await session.endAssistantMessage()
+    return {
+      reason: 'error',
+      error: 'parallel-suspension-not-supported',
+    }
+  }
+  // Normal suspension path: persist suspension.json and return suspended.
+  await session.persistSuspension()
+  await session.endAssistantMessage()
+  return { reason: 'suspended' }
+}
+```
+
+Make sure this replaces the existing `if (err instanceof SuspensionSignal)` block from Task 13's run-segment.ts code (Task 13's version doesn't have the collision check). The other catch branches (AbortError, generic error) stay unchanged.
 
 - [ ] **Step 1: Test 2 (full happy-path tool call through runLoop)**
 
@@ -3361,13 +3389,13 @@ it('test 2: tool-call happy path through runLoop', async () => {
   const stream = vi.fn().mockImplementation(() => {
     call++
     if (call === 1) {
-      return makeStreamShape([
+      return makeStreamMock([
         { type: 'text-delta', textDelta: 'reading' },
         { type: 'tool-call', toolCallId: 'tc_x', toolName: 'Read', input: { file_path: '/tmp/test.txt' } },
         { type: 'tool-result', toolCallId: 'tc_x', output: 'file contents here' },
-      ], 'tool-calls')
+      ], 'tool-calls')()
     }
-    return makeStreamShape([{ type: 'text-delta', textDelta: 'done' }], 'stop')
+    return makeStreamMock([{ type: 'text-delta', textDelta: 'done' }], 'stop')()
   })
   await runLoop(session, new AbortController().signal, { streamText: stream as any, getModel: fakeGetModel })
   expect(call).toBe(2)
@@ -3375,7 +3403,7 @@ it('test 2: tool-call happy path through runLoop', async () => {
 })
 ```
 
-(Helper `makeStreamShape` is the existing `makeStreamMock` shape — refactor for reuse if needed.)
+Note: Task 13 defines `makeStreamMock` as a `vi.fn().mockReturnValue({...})` — when calling it directly inside another mock implementation, invoke it with `()` to get the underlying object back. Reuse the single helper across all Task 13 and 13b tests for consistency.
 
 - [ ] **Step 2: Test 3 — permission-deny end-to-end**
 
@@ -3548,8 +3576,15 @@ it('test 9: cancel during resolution-handler execution', async () => {
 
   // Simulate the worker-side cancel-current-turn dispatch.
   const { handleMessage } = await import('../../ipc/server')
-  const channel = { postMessage: vi.fn() }
-  await handleMessage({ type: 'cancel-current-turn', sessionId: 's_t9' }, channel as any, /* manager */ undefined as any)
+  const { SessionManager } = await import('../../session/session-manager')
+  const channel = { postMessage: vi.fn(), onMessage: vi.fn() }
+  // We can't reach the SessionManager that owns this `session` (it's the
+  // one in the test fixture). Instead, build a fresh manager and register
+  // the same session id; the test only verifies that the abort fires on
+  // currentResolutionAbortController, which is owned by the test's
+  // session instance directly. Inject it by overriding manager.get():
+  const fakeManager = { get: () => session, createSession: async () => session, bootstrap: async () => {} } as any
+  await handleMessage(channel as any, fakeManager, { type: 'cancel-current-turn', sessionId: 's_t9' })
 
   expect(aborted).toHaveBeenCalled()
 })
@@ -3632,21 +3667,7 @@ it('test 15: tool-exec-status is not persisted', async () => {
 
 - [ ] **Step 11: Test 18 — parallel suspension invariant**
 
-(This tests that `runSegment`'s outer catch detects two concurrent SuspensionSignals from one segment's parallel tool calls and ends with `{reason: 'error', error: 'parallel-suspension-not-supported'}`. The implementation needs to be added to `runSegment` if not already present — see Task 13's "Step 2: Implement run-segment.ts" and add a check in the catch block:)
-
-```ts
-// In runSegment's catch:
-if (err instanceof SuspensionSignal) {
-  if (session.pendingSuspension && session.pendingSuspension.suspensionId !== err.suspensionId) {
-    // A second SuspensionSignal arrived after the first already set
-    // pendingSuspension. Phase 2a does not support parallel suspensions.
-    return { reason: 'error', error: 'parallel-suspension-not-supported' }
-  }
-  // ... existing handling
-}
-```
-
-Test:
+The `runSegment` collision check is implemented in **Step 0** above (already updated `src/agent/runtime/run-segment.ts`). This step only writes the test that exercises it.
 
 ```ts
 it('test 18: two parallel suspending tool calls → second raises parallel-suspension-not-supported error', async () => {
@@ -3659,12 +3680,13 @@ it('test 18: two parallel suspending tool calls → second raises parallel-suspe
     { type: 'tool-call', toolCallId: 'tc_b', toolName: 'Write', input: { file_path: '/tmp/oneship-t18b.txt', content: 'b' } },
   ], 'tool-calls')
   const result = await runSegment(session, new AbortController().signal, { streamText: stream as any, getModel: fakeGetModel })
-  // Either the segment returns suspended (first wins) OR error
-  // (collision detected). The invariant is that we don't lose data.
-  expect(['suspended', 'error']).toContain(result.reason)
-  if (result.reason === 'error') {
-    expect(result.error).toContain('parallel-suspension')
-  }
+  // Step 0's collision check detects the second SuspensionSignal and
+  // ends with a clear error code. The first suspension's pendingSuspension
+  // is left intact on disk so the user can still resolve it.
+  expect(result.reason).toBe('error')
+  expect(result.error).toBe('parallel-suspension-not-supported')
+  expect(session.pendingSuspension).not.toBeNull()
+  expect(session.pendingSuspension?.toolCallId).toBe('tc_a')   // first wins
 })
 ```
 
@@ -4134,56 +4156,156 @@ if (message.type === 'suspension-cancelled') {
 
 `cancelAllCardsForSession` lives in `src/main/suspension-router.ts` (created earlier in this task — see Step 2 above).
 
-- [ ] **Step 3b: Update Task 15 test plan**
+- [ ] **Step 3b: Add cancel-dispatch tests via the public IpcChannel API**
 
-The suspension-router test (`src/main/__tests__/suspension-router.test.ts`) covers the renderer-facing cancel dispatch. The worker-side three-path cancel dispatch is unit-testable directly against `src/agent/ipc/server.ts` — add a test file `src/agent/ipc/__tests__/cancel-dispatch.test.ts`:
+`handleMessage` is **not** exported from `src/agent/ipc/server.ts` — it's a private function called by the `channel.onMessage` callback wired up in `startIpcServer`. The right way to test is through the public `IpcChannel` interface, which IS exported and which both production (utilityProcess parentPort) and tests use.
+
+Create `src/agent/ipc/__tests__/cancel-dispatch.test.ts`:
 
 ```ts
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { handleMessage } from '../server'
-import { SessionManager } from '../../session/session-manager'
+import { startIpcServer, type IpcChannel, type IpcServerHandle } from '../server'
+import type { ToMain, ToWorker } from '../../../shared/agent-protocol'
+
+class TestChannel implements IpcChannel {
+  posted: ToMain[] = []
+  private handler: ((msg: ToWorker) => void) | null = null
+
+  postMessage(msg: ToMain): void {
+    this.posted.push(msg)
+  }
+
+  onMessage(callback: (msg: ToWorker) => void): void {
+    this.handler = callback
+  }
+
+  // Test helper: deliver a ToWorker message through the wired callback
+  // and wait one microtask for any async handlers to settle.
+  async deliver(msg: ToWorker): Promise<void> {
+    if (!this.handler) throw new Error('no handler wired')
+    this.handler(msg)
+    // Give async handlers a microtask + a few setTimeout(0) ticks to settle.
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0))
+  }
+}
 
 let tmp: string
-let manager: SessionManager
-let postedMessages: any[]
-let channel: { postMessage: (m: any) => void }
+let channel: TestChannel
+let server: IpcServerHandle
 
-beforeEach(() => {
+beforeEach(async () => {
   tmp = mkdtempSync(join(tmpdir(), 'oneship-cancel-dispatch-'))
   process.env.HOME = tmp
   process.env.ONESHIP_AGENT_ROOT = join(tmp, '.oneship-dev')
-  manager = new SessionManager()
-  postedMessages = []
-  channel = { postMessage: (m: any) => postedMessages.push(m) }
+  channel = new TestChannel()
+  server = await startIpcServer(channel)
+  // Drain the 'ready' message that startIpcServer posts on init.
+  channel.posted.length = 0
 })
-afterEach(() => { rmSync(tmp, { recursive: true, force: true }) })
+afterEach(async () => {
+  await server.shutdown()
+  rmSync(tmp, { recursive: true, force: true })
+})
 
-describe('worker cancel-current-turn dispatch', () => {
+async function getSessionFromServer(sessionId: string) {
+  // The server owns the SessionManager privately. To get a handle, create
+  // a session via the public IPC and then read it back from the handler's
+  // internal manager via a getter we add for tests. If Phase 1's
+  // SessionManager doesn't expose a get-by-id, the test creates a session
+  // and uses the manager indirectly via the IPC handlers.
+  // For Phase 2a these tests, we use the IPC create-session flow:
+  await channel.deliver({ type: 'create-session', sessionId } as any)
+  // Phase 1's test pattern (see resume.test.ts) reads the SessionManager
+  // directly — replicate that here. If startIpcServer doesn't expose the
+  // manager, refactor to export a test-only handle.
+  // For now, the tests below mutate session state via a helper module
+  // that mirrors the SessionManager singleton wired in startIpcServer.
+}
+
+describe('worker cancel-current-turn three-path dispatch', () => {
+  it('path 4: idle session emits aborted segment-finished as a no-op', async () => {
+    await channel.deliver({ type: 'create-session', sessionId: 's_p4' } as any)
+    channel.posted.length = 0
+    await channel.deliver({ type: 'cancel-current-turn', sessionId: 's_p4' })
+    expect(channel.posted.some((m) => m.type === 'segment-finished' && (m as any).reason === 'aborted')).toBe(true)
+  })
+
+  // NOTE: Path 1, 2, 3 tests all need to reach into the SessionManager
+  // owned by startIpcServer to mutate currentAbortController /
+  // currentResolutionAbortController / pendingSuspension. Phase 1's
+  // SessionManager is a private field on the closure; to test these
+  // paths we have two choices:
+  //
+  //   (a) Add a test-only export from server.ts:
+  //         export const __testOnlyGetSessions = () => sessionsRef
+  //       and have startIpcServer set the ref. Cheap but pollutes the
+  //       production module.
+  //
+  //   (b) Make handleMessage exported (public) so tests can call it
+  //       directly with a fresh SessionManager. Cleaner — handleMessage
+  //       is already a stable internal function, exporting it is no
+  //       semantic change.
+  //
+  // Phase 2a picks (b): export handleMessage from server.ts. The tests
+  // below assume handleMessage is exported. If you prefer (a), adapt the
+  // tests accordingly.
+})
+```
+
+Then export `handleMessage` from `src/agent/ipc/server.ts` (one-line change):
+
+```ts
+// src/agent/ipc/server.ts
+export async function handleMessage(  // changed from `async function`
+  channel: IpcChannel,
+  sessions: SessionManager,
+  msg: ToWorker,
+): Promise<void> {
+  // ... existing body
+}
+```
+
+And add the path-1/2/3 tests using direct `handleMessage` calls:
+
+```ts
+import { handleMessage } from '../server'
+import { SessionManager } from '../../session/session-manager'
+
+describe('worker cancel-current-turn dispatch (direct handleMessage)', () => {
+  let sessions: SessionManager
+  let directChannel: TestChannel
+
+  beforeEach(async () => {
+    sessions = new SessionManager()
+    await sessions.bootstrap()
+    directChannel = new TestChannel()
+  })
+
   it('path 1: aborts currentAbortController when runLoop is live', async () => {
-    const session = await manager.createSession({ sessionId: 's_p1' })
+    const session = await sessions.createSession({ sessionId: 's_p1' })
     const ctrl = new AbortController()
     let aborted = false
     ctrl.signal.addEventListener('abort', () => { aborted = true })
     session.currentAbortController = ctrl
-    await handleMessage({ type: 'cancel-current-turn', sessionId: 's_p1' }, channel, manager)
+    await handleMessage(directChannel, sessions, { type: 'cancel-current-turn', sessionId: 's_p1' })
     expect(aborted).toBe(true)
   })
 
   it('path 2: aborts currentResolutionAbortController when resolution is in flight', async () => {
-    const session = await manager.createSession({ sessionId: 's_p2' })
+    const session = await sessions.createSession({ sessionId: 's_p2' })
     const ctrl = new AbortController()
     let aborted = false
     ctrl.signal.addEventListener('abort', () => { aborted = true })
     session.currentResolutionAbortController = ctrl
-    await handleMessage({ type: 'cancel-current-turn', sessionId: 's_p2' }, channel, manager)
+    await handleMessage(directChannel, sessions, { type: 'cancel-current-turn', sessionId: 's_p2' })
     expect(aborted).toBe(true)
   })
 
   it('path 3: calls cancelSuspendedCard when session has a pending suspension and no controllers', async () => {
-    const session = await manager.createSession({ sessionId: 's_p3' })
+    const session = await sessions.createSession({ sessionId: 's_p3' })
     await session.appendUserMessage('hi')
     await session.beginAssistantMessage()
     await session.appendToolCallPart({ toolCallId: 'tc_1', toolName: 'Write', toolArgs: {} })
@@ -4203,20 +4325,14 @@ describe('worker cancel-current-turn dispatch', () => {
       summary: 'x',
       args: {},
     }
-    await handleMessage({ type: 'cancel-current-turn', sessionId: 's_p3' }, channel, manager)
+    await handleMessage(directChannel, sessions, { type: 'cancel-current-turn', sessionId: 's_p3' })
     expect(session.pendingSuspension).toBeNull()
-    expect(postedMessages.some((m) => m.type === 'suspension-cancelled')).toBe(true)
-  })
-
-  it('path 4: idle session emits aborted segment-finished as a no-op', async () => {
-    const session = await manager.createSession({ sessionId: 's_p4' })
-    await handleMessage({ type: 'cancel-current-turn', sessionId: 's_p4' }, channel, manager)
-    expect(postedMessages.some((m) => m.type === 'segment-finished' && m.reason === 'aborted')).toBe(true)
+    expect(directChannel.posted.some((m) => m.type === 'suspension-cancelled')).toBe(true)
   })
 })
 ```
 
-`handleMessage` is the function that the existing server.ts exports to dispatch ToWorker messages. If Phase 1 wraps the dispatch differently, adapt the test accordingly.
+Note the **two-test-block structure**: the first block uses `startIpcServer` + `TestChannel.deliver` for the idle path (path 4) which doesn't need session-state surgery; the second block calls `handleMessage` directly for paths 1–3 which DO need to reach into Session fields.
 
 - [ ] **Step 3c: Run the new dispatch test**
 
@@ -4378,8 +4494,17 @@ Expected: green.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/shared/agent-protocol.ts src/main/agent-host.ts src/main/suspension-router.ts src/main/index.ts src/main/__tests__/suspension-router.test.ts
-git commit -m "feat(main): suspension-router + cancel-current-turn three-path dispatch + API key env injection"
+git add \
+  src/shared/agent-protocol.ts \
+  src/main/agent-host.ts \
+  src/main/suspension-router.ts \
+  src/main/index.ts \
+  src/main/__tests__/suspension-router.test.ts \
+  src/agent/ipc/server.ts \
+  src/agent/ipc/rpc-client.ts \
+  src/agent/ipc/__tests__/cancel-dispatch.test.ts \
+  src/agent/ipc/__tests__/rpc-client.test.ts
+git commit -m "feat(main+worker): suspension-router + cancel-current-turn three-path dispatch + rpcCall + API key env injection"
 ```
 
 ---
