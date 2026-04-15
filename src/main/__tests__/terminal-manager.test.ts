@@ -104,6 +104,53 @@ describe('TerminalManager', () => {
     }
   })
 
+  it('strips host agent color and CI env vars before spawning PTYs', () => {
+    const originalNoColor = process.env.NO_COLOR
+    const originalCi = process.env.CI
+    const originalCodexCi = process.env.CODEX_CI
+    const originalCodexThreadId = process.env.CODEX_THREAD_ID
+    const originalCodexSandbox = process.env.CODEX_SANDBOX_NETWORK_DISABLED
+    const originalParentKeep = process.env.PARENT_KEEP
+
+    process.env.NO_COLOR = '1'
+    process.env.CI = 'true'
+    process.env.CODEX_CI = '1'
+    process.env.CODEX_THREAD_ID = 'thread-123'
+    process.env.CODEX_SANDBOX_NETWORK_DISABLED = '1'
+    process.env.PARENT_KEEP = 'keep-me'
+
+    try {
+      const terminalManager = new TerminalManager()
+      terminalManager.create('alpha', '/tmp/project', '/bin/zsh')
+
+      const env = mockPtyState.getSpawnOptions()?.env as Record<string, string | undefined>
+      expect(env.NO_COLOR).toBeUndefined()
+      expect(env.CI).toBeUndefined()
+      expect(env.CODEX_CI).toBeUndefined()
+      expect(env.CODEX_THREAD_ID).toBeUndefined()
+      expect(env.CODEX_SANDBOX_NETWORK_DISABLED).toBeUndefined()
+      expect(env.PARENT_KEEP).toBe('keep-me')
+    } finally {
+      if (originalNoColor === undefined) delete process.env.NO_COLOR
+      else process.env.NO_COLOR = originalNoColor
+
+      if (originalCi === undefined) delete process.env.CI
+      else process.env.CI = originalCi
+
+      if (originalCodexCi === undefined) delete process.env.CODEX_CI
+      else process.env.CODEX_CI = originalCodexCi
+
+      if (originalCodexThreadId === undefined) delete process.env.CODEX_THREAD_ID
+      else process.env.CODEX_THREAD_ID = originalCodexThreadId
+
+      if (originalCodexSandbox === undefined) delete process.env.CODEX_SANDBOX_NETWORK_DISABLED
+      else process.env.CODEX_SANDBOX_NETWORK_DISABLED = originalCodexSandbox
+
+      if (originalParentKeep === undefined) delete process.env.PARENT_KEEP
+      else process.env.PARENT_KEEP = originalParentKeep
+    }
+  })
+
   it('notifies exit listeners and removes the session when a PTY exits', () => {
     const terminalManager = new TerminalManager()
     const onExit = vi.fn()

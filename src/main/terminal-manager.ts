@@ -2,8 +2,10 @@ import * as pty from 'node-pty'
 import { randomUUID } from 'crypto'
 
 const terminalIdentityEnvKeys = new Set([
+  'CI',
   'LC_TERMINAL',
   'LC_TERMINAL_VERSION',
+  'NO_COLOR',
   'TERMINFO',
   'TERMINFO_DIRS',
   'TERM_PROGRAM',
@@ -15,6 +17,8 @@ const terminalIdentityEnvKeys = new Set([
 ])
 
 const terminalIdentityEnvPrefixes = [
+  'CLAUDE_CODE_',
+  'CODEX_',
   'ITERM_',
   'KITTY_',
   'WEZTERM_',
