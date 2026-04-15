@@ -1,6 +1,6 @@
 # Chief Agent Phase 2a — Design Spec
 
-**Scope:** First usable LLM-driven slice of Chief Agent. Real OpenRouter streaming, seven tools, permission + suspension framework, minimal UI, stub cleanup.
+**Scope:** First usable LLM-driven slice of Chief Agent. Real OpenRouter streaming, eight tools (Read, Glob, Grep, WebFetch, Write, Edit, Bash, AskUserQuestion), permission + suspension framework, minimal UI, stub cleanup.
 
 **Parent spec:** `2026-04-14-chief-agent-design.md` (§1–§16 remain the long-term architectural authority). This document is a delta: it specifies what Phase 2a builds, what it defers, and where it tightens the parent spec.
 
@@ -86,7 +86,7 @@ Phase 2a tightens or clarifies the following points in the parent spec:
    - **allow**: for `execution: 'local'`, run the inner executor; for `execution: 'rpc'`, send `rpc.request { kind: 'tool.exec' }` and await the response.
    - **deny**: return `{ error: 'user-denied' }` as tool-result (no prompt).
    - **prompt-needed**: push a `permission` SuspensionSpec to `session.pendingSuspension`, write a `{__suspended: true}` placeholder tool-result, throw `SuspensionSignal`. `runSegment` catches the signal, persists `suspension.json`, and returns `{ reason: 'suspended' }`.
-5. **Suspending tools (AskUserQuestion).** The SuspensionSpec has `kind: 'question'`. The `__suspended` placeholder is written before throwing `SuspensionSignal`, and `runSegment` catches it and ends the segment via the same path as a permission prompt. Whether the suspension is raised worker-side (inside the tool wrapper) or main-side (inside the main-process tool executor, which relays a suspension request back to the worker) is an open question — see §6.5 and §17 Q2. The plan task T-05 resolves it before implementation begins; §5.1 intentionally does not take a position.
+5. **Suspending tools (AskUserQuestion).** `AskUserQuestion` is `execution: 'local'`, `approvalClass: 'ui'` per the parent spec §6.3a assignment (updated 2026-04-15). It is a worker-side control-flow tool, colocated with other suspending tools. When the LLM invokes it, the wrapper pushes a `{ kind: 'question' }` SuspensionSpec onto `session.pendingSuspension`, writes a `{__suspended: true}` placeholder via `part-append`, and throws `SuspensionSignal`. `runSegment` catches the signal and ends the segment through the same code path as permission suspensions. Main's `suspension-router` receives the `suspension-raised` IPC and dispatches `ask.prompt` to the renderer for UI mediation — main is never the executor of the tool, only the host of the card.
 6. **runLoop follows finish reason.** `tool-calls` → continue to next segment. Anything else → persist `lastSegmentReason` and return.
 7. **Suspension resolution.** Main's `suspension-router` receives `suspension-raised`, looks at `spec.kind`, dispatches `permission.prompt` or `ask.prompt` to the renderer. Renderer shows the appropriate card. User action → `resolve-suspension` IPC back to main → main updates session state (allowlist additions, singleUseApproval entries) → main forwards `resolve-suspension` to worker → worker emits a `part-update` event to replace the `__suspended` placeholder tool-result with its resolved value, appends a synthetic user message to the session history describing the resolution, deletes `suspension.json`, and clears `pendingSuspension` → worker triggers a new `runLoop` iteration. (`cleanupOrphanPlaceholders` is a separate safety net for orphans from crashed sessions; see §9.2 — it does NOT perform the happy-path rewrite.)
 
@@ -127,7 +127,7 @@ export const TOOL_MANIFESTS: Record<string, ToolManifest> = {
   Write: { ... execution: 'local', approvalClass: 'write', ... },
   Edit: { ... execution: 'local', approvalClass: 'write', ... },
   Bash: { ... execution: 'rpc', approvalClass: 'exec', ... },
-  AskUserQuestion: { ... execution: 'rpc', approvalClass: 'ui', ... },
+  AskUserQuestion: { ... execution: 'local', approvalClass: 'ui', ... },
 }
 ```
 
@@ -152,7 +152,7 @@ Rules:
 - **Suspended** — the wrapper sets `{__suspended: true, suspensionId}` as the placeholder tool-result BEFORE throwing `SuspensionSignal`. This is written to the event log via `part-append`, then later replaced via `part-update` when the suspension resolves.
 - **Resolved** — when the explicit §8.2 step 12 rewrite runs, it emits a `part-update` replacing the placeholder with `{resolved: true, answer?: <string>}`. This is the post-resolution marker the LLM sees for a question or permission-allow. (For permission-allow the LLM doesn't actually need the `resolved` marker because the subsequent synthetic user message tells it to re-emit; but the marker is harmless and makes the event log self-describing.)
 
-**Disambiguation guarantee**: a tool's natural success payload MUST NOT have any top-level key named `__suspended`, `resolved`, or `error`. For Phase 2a's seven tools this is trivially true (none have such keys). A lint/test rule is added that rejects any new tool whose manifest-defined output schema includes one of these reserved keys at top level. This preserves the "success = anything not matching a discriminator" invariant without a wrapper.
+**Disambiguation guarantee**: a tool's natural success payload MUST NOT have any top-level key named `__suspended`, `resolved`, or `error`. For Phase 2a's eight tools this is trivially true (none have such keys). A lint/test rule is added that rejects any new tool whose manifest-defined output schema includes one of these reserved keys at top level. This preserves the "success = anything not matching a discriminator" invariant without a wrapper.
 
 Error codes Phase 2a is expected to emit (non-exhaustive but all must be discriminable):
 - `'user-denied'` — permission was denied
@@ -266,7 +266,7 @@ The path guard is **not** a substitute for permission approval. A Write in `norm
 
 ### 6.5 Tool implementations
 
-Each of the seven tools gets its own file. Phase 2a implementations are MVP-shaped (no advanced features):
+Each of the eight tools gets its own file. Phase 2a implementations are MVP-shaped (no advanced features):
 
 - **Read** (`src/agent/tools/read.ts`): file_path (required), offset, limit. Returns file contents as a string. Honors path guard.
 - **Glob** (`src/agent/tools/glob.ts`): pattern (required), path (optional). Returns matching paths. Uses `fast-glob` (already in dependency tree? — verify during plan).
@@ -275,10 +275,7 @@ Each of the seven tools gets its own file. Phase 2a implementations are MVP-shap
 - **Write** (`src/agent/tools/write.ts`): file_path (required), content (required). Always overwrites. Honors path guard. Triggers write approval.
 - **Edit** (`src/agent/tools/edit.ts`): file_path (required), old_string (required), new_string (required), replace_all (optional). Honors path guard. Triggers write approval.
 - **Bash** (`src/main/tool-executors/bash.ts`): cmd (required), cwd (optional, defaults to project root). Uses the existing `TerminalManager` — Phase 2a adds a `runOneShot` method to TerminalManager if one doesn't already exist. Streams stdout/stderr into a string buffer, returns `{ stdout, stderr, exitCode }` when the command exits. Honors an abort signal passed through the rpc envelope. Triggers exec approval.
-- **AskUserQuestion** (`src/main/tool-executors/ask-user-question.ts` or `src/agent/tools/ask-user-question.ts`, TBD by plan task T-05): whichever side ends up owning the executor, the net behavior is the same: the tool raises a `{ kind: 'question' }` SuspensionSpec, writes a `__suspended` placeholder tool-result via `part-update`, throws `SuspensionSignal`, and `runSegment` ends the segment. The question-prompt card is dispatched to the renderer by main's `suspension-router` regardless of who raised the suspension. **Open question** (tracked in §17 Q2): does the suspension get raised by the worker's tool wrapper (colocated with other suspending tools) or by the main-side tool executor (colocated with other rpc executors)? Two options, plan task T-05 picks one before implementation starts:
-  - **(a) Worker-raised**: `AskUserQuestion` is wrapped as a local tool in the worker (execution: 'local' despite the manifest saying 'rpc' — or change the manifest to 'local'). Pro: single source of truth for `session.pendingSuspension` on the worker. Con: breaks the "UI tools run in main" heuristic in §6.3a.
-  - **(b) Main-raised**: `AskUserQuestion` is a true rpc tool; worker wrapper sends `rpc.request { kind: 'tool.exec' }`, main's executor raises the suspension via a new `rpc.request { kind: 'suspension.raise' }` back to the worker (which then throws `SuspensionSignal`). Pro: respects §6.3a. Con: new IPC round-trip, slightly more complex state machine.
-  - Plan task T-05's deliverable is a one-sentence decision and the single IPC message type it adds (if any). §5.1 step 5 must be updated to match whichever is chosen before coding begins.
+- **AskUserQuestion** (`src/agent/tools/ask-user-question.ts`): worker-side control-flow tool, `execution: 'local'`, `approvalClass: 'ui'`. Per the parent spec §6.3a assignment (updated 2026-04-15), `ui`-class tools pass through the permission check and run their own suspension instead. The tool wrapper pushes a `SuspensionSpec { kind: 'question', ... }` onto `session.pendingSuspension`, writes a `{__suspended: true, suspensionId}` placeholder tool-result via `part-append`, and throws `SuspensionSignal`. `runSegment` catches the signal and ends the segment. Main receives `suspension-raised`, dispatches `ask.prompt { cardId, question, choices }` to the renderer, waits for `ask.respond`, and sends `resolve-suspension { kind: 'question-answered', answer }` back to the worker. The worker emits a `part-update` replacing the placeholder with `{ resolved: true, answer }` per §8.2 step 12, then triggers a new `runLoop` iteration. No IPC round-trip for the suspension itself — it stays worker-raised.
 
 ## 7. Runtime
 
@@ -630,9 +627,16 @@ Calls into `TerminalManager` for one-shot command execution. Plan task should ve
 
 Abort: the executor listens for `rpc.cancel` messages and kills the child process group.
 
-### 11.5 `ask-user-question` executor (location TBD)
+### 11.5 Main-side role for AskUserQuestion
 
-Exact wiring depends on plan task T-05 (§6.5). File lives in `src/main/tool-executors/ask-user-question.ts` if main-raised, or `src/agent/tools/ask-user-question.ts` if worker-raised. Either way, the behavior delivered is: the tool raises a `question` SuspensionSpec, main's `suspension-router` dispatches `ask.prompt` to the renderer, renderer shows the AskCard, user answers, resolution arrives via `resolve-suspension`, worker writes the explicit `part-update` rewrite per §8.2 step 12 with the answer.
+AskUserQuestion lives in `src/agent/tools/ask-user-question.ts` (worker-side, per §6.5 and the parent spec §6.3a assignment). Main does not have an executor for it — main's only role is:
+
+1. Receive `suspension-raised` with `spec.kind === 'question'` from the worker.
+2. Dispatch `ask.prompt { cardId, question, choices }` to the renderer via `chief:event`.
+3. Receive `ask.respond { cardId, answer }` from the renderer.
+4. Send `resolve-suspension { suspensionId, resolution: { kind: 'question-answered', answer } }` to the worker.
+
+All of this happens in `suspension-router.ts`; no file under `src/main/tool-executors/` is needed for AskUserQuestion.
 
 ## 12. IPC Protocol Extensions
 
@@ -749,7 +753,7 @@ Additional pure-function coverage:
 - Retry classification: 429, 529, 401, 400, network timeout (ECONNRESET, ETIMEDOUT), abort, generic error — each classified correctly.
 - `cleanupOrphanPlaceholders`: orphan → rewrite to error; current suspension's placeholder → untouched; multiple orphans → multiple rewrites; no orphans → no writes.
 
-**Parallel tool-calls invariant (Phase 2a constraint, tested as invariant):** Phase 2a's design assumes at most one `pendingSuspension` per session. If the LLM emits two parallel tool calls in the same step and BOTH of them trigger `prompt-needed`, the second `SuspensionSignal` throw will find `session.pendingSuspension` already populated. The runSegment outer catch must detect this collision, log a hard error, end the segment with `{reason: 'error', error: 'parallel-suspension-not-supported'}`, and leave the first suspension intact on disk. Test 17: two parallel `Write` tool-calls in one segment → second raises error; first proceeds through normal resolution flow. (Parent spec §15.5's `deferredSuspensions` queue is the proper long-term fix; it is deferred to Phase 2b. In Phase 2a's seven-tool world the collision is extremely unlikely — the LLM rarely parallelizes writes — but the invariant check must exist.)
+**Parallel tool-calls invariant (Phase 2a constraint, tested as invariant):** Phase 2a's design assumes at most one `pendingSuspension` per session. If the LLM emits two parallel tool calls in the same step and BOTH of them trigger `prompt-needed`, the second `SuspensionSignal` throw will find `session.pendingSuspension` already populated. The runSegment outer catch must detect this collision, log a hard error, end the segment with `{reason: 'error', error: 'parallel-suspension-not-supported'}`, and leave the first suspension intact on disk. Test 17: two parallel `Write` tool-calls in one segment → second raises error; first proceeds through normal resolution flow. (Parent spec §15.5's `deferredSuspensions` queue is the proper long-term fix; it is deferred to Phase 2b. In Phase 2a's eight-tool world the collision is extremely unlikely — the LLM rarely parallelizes writes — but the invariant check must exist.)
 
 ### 14.2 Smoke test (opt-in, not in CI)
 
@@ -796,6 +800,7 @@ src/agent/tools/
   web-fetch.ts
   write.ts
   edit.ts
+  ask-user-question.ts                  # local / ui — worker-side suspending tool
   index.ts
   __tests__/
     check-permission.test.ts
@@ -805,6 +810,7 @@ src/agent/tools/
     edit.test.ts
     grep.test.ts
     glob.test.ts
+    ask-user-question.test.ts
 
 src/main/
   chief-preferences.ts
@@ -812,8 +818,7 @@ src/main/
   suspension-router.ts
   permission-reconciler.ts
   tool-executors/
-    bash.ts
-    ask-user-question.ts
+    bash.ts                             # rpc / exec — only main-side executor in Phase 2a
     index.ts
   __tests__/
     chief-preferences.test.ts
@@ -869,15 +874,12 @@ Acceptance: `grep -rn "Phase1NotImplemented\|appendAssistantStubReply" src/` ret
 1. **Vercel AI SDK v6 `experimental_context` behavior in mocks.** Our tool executors rely on `ctx.experimental_context.session` being the real Session instance. If our mock of `streamText` passes this differently from the real SDK, unit tests pass but production fails. Mitigation: the smoke test in §14.2 validates that real SDK invocation still wires context through.
 2. **OpenRouter tool-call quirks with Anthropic models.** OpenRouter proxies to provider APIs, and Anthropic's tool-calling format has some headers (e.g. prompt caching) that behave differently via OpenRouter than via direct Anthropic API. Phase 2a does NOT test cache-control behavior; §7.1 static prompt caching may silently not cache through OpenRouter. Mitigation: accept the uncached cost for Phase 2a; Phase 2b verifies cache hits via `x-openrouter-cost` headers.
 3. **Bash abort propagation to child process.** `TerminalManager` may not currently expose a "kill just this child" API; if not, the plan must add one. Validation task in the plan.
-4. **Ambiguity in AskUserQuestion suspension raising location (worker vs main).** Flagged in §6.5 — final decision deferred to plan task T-05.
-
 ## 17. Open Questions (must be resolved during plan writing)
 
 1. Does `TerminalManager` already have a one-shot exec API? (§11.4 decision)
-2. Does the AskUserQuestion tool raise its suspension worker-side or main-side? (§6.5 decision)
-3. What exact wording does the synthetic user message take for each resolution kind? (§8.2 step 11)
-4. Is `/tmp` the right "allowed outside workspace" path, or should it be more restrictive? (§6.4 decision)
-5. Should the Preferences panel require an API key before enabling Chief Agent at all, or allow a read-only "no key configured" state? (UX decision)
+2. What exact wording does the synthetic user message take for each resolution kind? (§8.2 step 12)
+3. Is `/tmp` the right "allowed outside workspace" path, or should it be more restrictive? (§6.4 decision)
+4. Should the Preferences panel require an API key before enabling Chief Agent at all, or allow a read-only "no key configured" state? (UX decision)
 
 ## 18. References
 

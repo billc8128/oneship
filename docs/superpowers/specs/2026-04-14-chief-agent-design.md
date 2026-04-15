@@ -146,13 +146,20 @@ type ToWorker =
   | { type: 'send-user-message', sessionId: string, content: string }
   | { type: 'cancel-current-turn', sessionId: string }
   // Suspension responses (see §15.5)
+  // NOTE (2026-04-15, Phase 2a update): the `'cautious-allowed' / 'cautious-denied'` kinds
+  // are retired and replaced by the permission-mode rework (§12). The current resolution
+  // kinds are: 'plan-approved' | 'plan-modified' | 'plan-rejected' | 'question-answered'
+  // | 'permission-allow' | 'permission-allow-always' | 'permission-deny'. See the
+  // Phase 2a spec §9.1 for the exact union shape and §12.3 for the flow.
   | { type: 'resolve-suspension', sessionId: string, suspensionId: string, resolution:
         | { kind: 'plan-approved', injectedMessage: string }
         | { kind: 'plan-modified', modifiedPlan: string }
         | { kind: 'plan-rejected', reason: string }
         | { kind: 'question-answered', answer: string | { choice: string } }
-        | { kind: 'cautious-allowed' }
-        | { kind: 'cautious-denied' }
+        | { kind: 'permission-allow' }
+        | { kind: 'permission-allow-always' }
+        | { kind: 'permission-deny' },
+      stateUpdate?: { addSingleUseKey?: string; addAllowOnceClass?: ApprovalClass }
     }
   // Settings
   | { type: 'set-permission-mode', sessionId: string, mode: PermissionMode }
@@ -179,12 +186,19 @@ type ToMain =
   // RPC requests into Main (worker needs Main-side data)
   | { type: 'rpc-request', requestId: string, op: RpcOp, params: unknown }
 
-type PermissionMode = 'trust' | 'cautious'
+// NOTE (Phase 2a): `PermissionMode` is widened to three values — `'trust' | 'normal' | 'strict'`.
+// `'cautious'` is retired. See §12 for the full truth table and the Phase 2a spec §8.
+type PermissionMode = 'trust' | 'normal' | 'strict'
 
+type ApprovalClass = 'read' | 'write' | 'exec' | 'ui'  // See §6.3a
+
+// NOTE (Phase 2a): the `'cautious'` SuspensionSpec kind is retired; its replacement is
+// `'permission'` with `approvalClass`, `summary`, and `args`. See Phase 2a spec §9.1.
 type SuspensionSpec =
   | { suspensionId: string, kind: 'plan', planId: string, plan: PlanSpec }
   | { suspensionId: string, kind: 'question', questionId: string, question: AskSpec }
-  | { suspensionId: string, kind: 'cautious', toolCallId: string, toolName: string, args: unknown }
+  | { suspensionId: string, kind: 'permission', messageId: string, partIndex: number,
+      toolCallId: string, toolName: string, approvalClass: ApprovalClass, summary: string, args: unknown }
 
 type SegmentFinishReason =
   | 'natural'        // model produced a final assistant message with no tool calls
@@ -413,8 +427,8 @@ export const allTools = (session: Session) => ({
 - **Error handling**: a tool that throws is caught by Vercel AI SDK and returned to the LLM as a tool-result part with the error message sanitized. The LLM decides how to react. See §13.
 - **Async / streaming**: tools can be async (all of OneShip's are). Tools can also yield intermediate progress via `AsyncIterable`, used by `Bash` to stream stdout into the UI during execution.
 - **Abort**: the `abortSignal` from the execute context is threaded through any spawned child processes, so `session.cancelCurrentTurn()` actually kills in-flight bash commands. Tool implementations must treat abort as cooperative — clean up shell handles, file descriptors, etc.
-- **Suspending tools**: `AskUserQuestion`, `ExitPlanMode`, and any Cautious-mode tool that gets denied user approval do not block inside `execute()`. They push a `SuspensionSpec` onto `session.pendingSuspension`, return a placeholder tool-result (`{ __suspended: true, suspensionId }`), and the session loop ends the segment cleanly via abort. See §15.5 for the full lifecycle.
-- **Permission gating**: before execution, the tool runner checks the session's permission mode. Trust mode runs immediately. Cautious mode (for `Bash / Write / Edit / CronCreate / CronDelete`) raises a `cautious` suspension before invoking `execute()`. The user's allow/deny decision arrives via `resolve-suspension` and the next segment either proceeds with the call or substitutes a `{ error: 'user-denied' }` tool-result.
+- **Suspending tools**: `AskUserQuestion`, `ExitPlanMode`, and any tool whose `checkPermission` returns `prompt-needed` do not block inside `execute()`. They push a `SuspensionSpec` onto `session.pendingSuspension`, return a placeholder tool-result (`{ __suspended: true, suspensionId }`), and the session loop ends the segment cleanly via abort. See §15.5 for the full lifecycle.
+- **Permission gating**: before execution, the worker-side tool wrapper calls `checkPermission` (§12.2) against the session's mirror of the current permission mode. If the result is `allow`, the tool runs; if `deny`, it returns `{ error: 'user-denied' }` immediately; if `prompt-needed`, a `permission` SuspensionSpec is raised (§12.3). Under the §6.3a permission system, this happens uniformly across all modes (trust / normal / strict) and all approval classes (read / write / exec / ui).
 - **Plan Mode mask**: in Plan Mode, `allTools()` omits `Write / Edit / Bash / CronCreate / CronDelete / Agent` **and** restricts `Skill`. The LLM only sees the remaining tools. See §11.1 for the Skill-in-PlanMode rules; the short version is that Skill is *not* removed (so the model can still invoke read-only skills) but the sub-agent it spawns inherits Plan Mode and the same mask is applied recursively.
 
 ### 6.3a Tool execution topology (Phase 2 addendum — authoritative)
@@ -436,11 +450,17 @@ Every tool's manifest entry MUST declare both:
 
 There is no default and no context-dependent third mode. The manifest is the single authority for both fields; no other code path may hardcode them.
 
-**Rule 3 — Approval is orthogonal to execution location**
+**Rule 3 — Approval is orthogonal to execution location; main owns policy, worker evaluates**
 
-Main is the authority for permission policy and user mediation. Worker is the authority for tool execution. The two authorities do not overlap:
+The three roles in permission:
 
-- A `local` tool executed in the worker can still require approval mediated by main.
+- **Policy source of truth** (main): owns the default permission mode in Preferences, owns the per-session mode switch IPC (`set-permission-mode`), owns the permission UI (PermissionCard), and owns user mediation outcomes. Any state change flows through main.
+- **Policy evaluation** (worker): each `runSegment` has a pure-function `checkPermission(mode, class, allowlist, singleUse)` (§12.2) that it runs **locally in the worker** against the session's mirror of the current mode and allowlist state. This keeps the hot path (read-class tools in trust/normal modes) from doing a worker→main→worker round-trip on every tool call. Main keeps the worker's mirror fresh via `set-permission-mode` and via `stateUpdate` piggy-backed on `resolve-suspension`.
+- **User mediation** (main): when `checkPermission` returns `prompt-needed`, the worker raises a permission suspension and ends the segment. Main then receives `suspension-raised`, renders the PermissionCard, waits for the user, and sends `resolve-suspension` (with any `stateUpdate` the decision requires) back to the worker.
+
+Orthogonality of approval vs execution location:
+
+- A `local` tool executed in the worker can still require approval mediated by main. (Write and Edit are the common case.)
 - An `rpc` tool executed in main can still be directly allowed (e.g. Bash in Trust mode) without UI mediation.
 - Path-guard, workspace-guard, and other security checks that both worker and main must enforce MUST live in a shared pure module (`src/shared/tool-guards/`) and be imported by both sides. Security logic MUST NOT be duplicated in a main-side IPC handler.
 
@@ -455,7 +475,7 @@ This split prevents drift: worker and main cannot disagree on execution location
 
 **Phase 2a assignment**
 
-The seven tools in Phase 2a are assigned as follows:
+The eight tools in Phase 2a are assigned as follows:
 
 | Tool | execution | approvalClass |
 |---|---|---|
@@ -466,7 +486,9 @@ The seven tools in Phase 2a are assigned as follows:
 | Write | local | write |
 | Edit | local | write |
 | Bash | rpc | exec |
-| AskUserQuestion | rpc | ui |
+| AskUserQuestion | local | ui |
+
+`AskUserQuestion` is intentionally `local` even though it mediates with the user. It is a **control-flow tool**: its job is to push a `SuspensionSpec` onto `session.pendingSuspension` (a worker-side field) and throw `SuspensionSignal` so the segment ends. It does not execute anything main owns. Main handles the UI side purely by receiving `suspension-raised` and dispatching `ask.prompt` to the renderer; the tool itself lives in the worker's registry alongside other suspending control-flow tools. This keeps the single source of truth for `pendingSuspension` on the worker and avoids an unnecessary worker→main→worker round-trip on every Ask call.
 
 Phase 2b and later additions must extend this table, not create parallel classification schemes.
 
@@ -489,7 +511,7 @@ This table is evaluated by a pure function `checkPermission(mode, class, allowli
 
 Each tool gets a dedicated file, but a few are worth pre-committing architecture on:
 
-**Bash & BashOutput & Monitor**: maintain a session-scoped `Map<shellId, RunningShell>` in the worker. `Bash(run_in_background: true)` returns a shell_id; the shell keeps running in the background with its stdout/stderr piped into a ring buffer. `BashOutput(shell_id)` reads the buffer's current state non-blockingly. `Monitor(shell_id, timeoutMs)` awaits new output until either the shell exits, the timeout hits, or the buffer contains a match for an optional `waitFor` regex.
+**Bash & BashOutput & Monitor**: per §6.3a, `Bash` is `execution: 'rpc' / approvalClass: 'exec'`. Because `BashOutput` and `Monitor` must read state owned by the same shell lifetime, the entire Bash tool bundle is main-side: the session-scoped `Map<shellId, RunningShell>` lives in main (not worker), wrapping the existing `TerminalManager` or its successor, and all three tools are `rpc` executors in `src/main/tool-executors/`. `Bash(run_in_background: true)` returns a shell_id; the shell keeps running in the background with its stdout/stderr piped into a ring buffer in main. `BashOutput(shell_id)` reads the buffer's current state non-blockingly. `Monitor(shell_id, timeoutMs)` awaits new output until either the shell exits, the timeout hits, or the buffer contains a match for an optional `waitFor` regex. (Phase 2a only ships one-shot `Bash`; BashOutput and Monitor land in Phase 2b but keep main-side ownership from day one.)
 
 **Skill**: on call, loads the skill file from `~/.oneship/skills/<name>/SKILL.md`, parses the frontmatter for `tools:` restrictions, then runs a sub-agent using the skill body as the initial user message, with only the allowed tools. See §8.
 
@@ -863,32 +885,89 @@ Orthogonal. Trust mode + Plan Mode = "I trust you to execute without per-tool co
 
 ## 12. Permission System
 
-### 12.1 Two modes
+> **Phase 2 addendum**: §12 was rewritten on 2026-04-15 to match §6.3a. The original design had two modes (`trust` / `cautious`) and placed the policy decision inside a main-side tool runner. The current design has three modes (`trust` / `normal` / `strict`) and places policy **source of truth** in main, policy **evaluation** in the worker, and user **mediation** in main. See §6.3a Rule 3 for the role split and this section for the flows.
 
-- **Trust** (default): destructive tools (`Bash`, `Write`, `Edit`, `CronCreate`, `CronDelete`) run immediately. No confirmation dialogs. **No blacklist** — the user has explicitly opted into full trust.
-- **Cautious**: the same tools require a native approval dialog per call. `Read`, `Glob`, `Grep`, and all other non-destructive tools run without prompting in either mode.
+### 12.1 Three modes
 
-Setting is at session level (inherited from user preference). User can switch mid-session.
+- **Trust** (optional, autopilot): every tool class runs immediately. No confirmation cards. No blacklist. Users who opt into Trust accept the deal.
+- **Normal** (default): `read`-class tools run immediately; `write`, `exec`, and `ui` classes prompt the user. This is the default for new sessions.
+- **Strict**: every class including `read` prompts the user. For users who want to review every filesystem/process interaction.
 
-### 12.2 Cautious approval flow
+Mode is per-session, initialized from the user's default in Preferences. The user can switch mid-session via a session-level toggle in the chief-chat UI.
 
-Cautious uses the same suspension protocol as Plan and Ask (§15.5). The difference is that `execute()` for the gated tool isn't called *at all* until approval lands.
+The approval class of each tool is declared in the shared tool manifest (§6.3a, Rule 2). The interaction between mode and class is the truth table in §6.3a "Approval policy truth table" — not duplicated here.
 
-1. Tool runner receives a call for `Bash("rm /tmp/foo")`.
-2. The runner pushes `{ kind: 'cautious', suspensionId, toolCallId, toolName, args }` onto `session.pendingSuspension`, and returns a placeholder tool-result `{ __suspended: true, suspensionId }` from a dispatcher wrapping the real `execute()`.
-3. Segment ends; `suspension-raised` IPC is emitted.
-4. Main shows `dialog.showMessageBox` with "Allow this Bash command? \n\n rm /tmp/foo \n\n [Allow] [Deny]".
-5. User's choice comes back as `resolve-suspension` with `kind: 'cautious-allowed'` or `'cautious-denied'`.
-6. **Allow**: the worker rewrites the placeholder tool-result by actually invoking the underlying tool's `execute()` now, capturing its real result. The next segment proceeds.
-7. **Deny**: the worker rewrites the placeholder to `{ error: 'user-denied', hint: 'User declined this action.' }`. The next segment proceeds; the model sees the denial and adapts.
+### 12.2 `checkPermission` — worker-local pure function
 
-The "rewrite the placeholder" pattern (vs. appending a follow-up message) keeps the message history clean: one tool_use block → one tool_result block, regardless of whether the user took 100ms or 5 minutes to decide.
+The worker evaluates permission locally on every tool call using a pure function:
 
-### 12.3 Trust mode is honest
+```ts
+// src/agent/tools/check-permission.ts (Phase 2 implementation)
+function checkPermission(
+  session: Session,
+  approvalClass: ApprovalClass,
+  toolName: string,
+  args: unknown,
+): 'allow' | 'deny' | 'prompt-needed'
+```
+
+Inputs the function reads (all from worker-side session state):
+
+- `session.meta.permissionMode` — the mode, kept in sync with main via `set-permission-mode` IPC
+- `session.allowOnceClasses: Set<ApprovalClass>` — Allow-Always allowlist, session-scoped
+- `session.singleUseApprovals: Set<string>` — single-use keys from prior Allow decisions, consumed on hit
+- `approvalClass` — from the shared manifest
+- `toolName`, `args` — for computing the single-use key
+
+The function is pure: given the same inputs it always returns the same decision. No IO, no async, no IPC.
+
+Evaluation rules (see also §6.3a truth table):
+
+1. `approvalClass === 'ui'` → always `allow` (pass-through). UI-class tools do their own suspension via the `question` SuspensionSpec path; permission is not the right layer.
+2. `mode === 'trust'` → always `allow` regardless of class.
+3. If `session.allowOnceClasses.has(approvalClass)` → `allow` (user already said Allow Always for this class in this session).
+4. If `session.singleUseApprovals.has(singleUseKey(toolName, args))` → `allow` and **consume** the key (delete from set).
+5. `mode === 'normal'` AND `approvalClass === 'read'` → `allow`.
+6. Otherwise → `prompt-needed`.
+
+Why evaluation is in the worker, not main:
+
+- The hot path (read-class tools in trust or normal modes) is just a map lookup plus a truth-table check. An RPC round-trip for every Read/Glob/Grep call would measurably slow segments that fan out across many files.
+- State sync is cheap: main pushes mode changes via `set-permission-mode` and single-use additions via `stateUpdate` piggy-backed on `resolve-suspension` (§12.3). These are low-frequency events compared to tool calls.
+
+### 12.3 Approval flow (uniform — all classes, both prompt and suspend paths)
+
+All classes that need prompting go through the same flow. There is no "cautious-only" path anymore — the old §12.2 is superseded.
+
+1. The worker tool wrapper for a gated tool calls `checkPermission(...)`.
+2. **allow** → wrapper proceeds. For `local` tools, it runs the inner executor. For `rpc` tools, it sends `rpc.request { kind: 'tool.exec' }` to main and awaits the response.
+3. **deny** → wrapper returns `{ error: 'user-denied' }` as the tool-result. (Deny is only produced by explicit user rejection of an earlier prompt whose outcome is still cached; in Phase 2a this path is only reached on re-emit after a denied suspension.)
+4. **prompt-needed** → wrapper:
+   - generates `suspensionId = nanoid()`
+   - pushes `SuspensionSpec { kind: 'permission', suspensionId, messageId, partIndex, toolCallId, toolName, approvalClass, summary, args }` onto `session.pendingSuspension`
+   - writes a `part-append { type: 'tool-result', toolCallId, result: { __suspended: true, suspensionId } }` placeholder to the event log
+   - throws `SuspensionSignal(suspensionId)`
+5. `runSegment` catches the signal, persists `suspension.json`, writes `message-finish`, returns `{reason: 'suspended'}`.
+6. Worker sends `suspension-raised { sessionId, spec }` to main.
+7. Main's `suspension-router` dispatches `permission.prompt { cardId, spec }` to the renderer. The renderer shows a PermissionCard with Allow / Allow Always (normal mode only) / Deny buttons.
+8. User clicks a button. Renderer sends `permission.respond { cardId, action }` to main.
+9. Main translates the action to a resolution and a state update, and sends `resolve-suspension { suspensionId, resolution, stateUpdate? }` to the worker:
+   - **Allow** → `resolution: { kind: 'permission-allow' }`, `stateUpdate: { addSingleUseKey }`
+   - **Allow Always** → `resolution: { kind: 'permission-allow-always' }`, `stateUpdate: { addAllowOnceClass }`
+   - **Deny** → `resolution: { kind: 'permission-deny' }`, no `stateUpdate`
+10. Worker applies `stateUpdate` (if present) **before** rewriting the placeholder. This ensures the next segment's `checkPermission` sees the new state.
+11. Worker emits a `part-update` replacing the `__suspended` placeholder with the resolved tool-result:
+    - Allow / Allow Always → `{ resolved: true }`
+    - Deny → `{ error: 'user-denied' }`
+12. Worker appends a synthetic user message describing the decision (e.g. `"[User allowed the previous Bash call]"`). This is what drives the LLM to re-emit the tool call (or not) on the next segment.
+13. Worker deletes `suspension.json`, clears `pendingSuspension`.
+14. Worker triggers a new `runLoop` iteration. If the LLM re-emits an Allow tool call with identical args, `checkPermission` hits the single-use key (or the allowlist) and the tool executes this time.
+
+### 12.4 Trust mode is honest
 
 No hidden allowlists or denylists in Trust mode. `rm -rf /` will run if the model calls it. The user chose Trust mode; this is the deal. In exchange, the experience is frictionless — which is what users running long autonomous tasks want.
 
-(Cautious mode is the answer for users who want safety. Forcing both at once creates a mushy middle with the worst of each.)
+Normal mode is the answer for users who want a middle ground; Strict is the answer for users who want maximum review. Each mode is internally consistent; there is no "mushy middle with the worst of each."
 
 ---
 
@@ -913,7 +992,7 @@ Wrapping `streamText` with a retry helper borrowed from cc-src `services/api/wit
 
 ### 13.3 Permission denials
 
-When Cautious mode denies a tool, the denial is returned as `{ error: 'user-denied' }` with a hint. The LLM treats this like any other tool error — usually it either asks the user why or tries a different approach.
+When a user denies a permission prompt (in Normal or Strict mode), the resolved tool-result is `{ error: 'user-denied' }`. The LLM treats this like any other tool error — usually it either asks the user why or tries a different approach. See §12.3 for the flow.
 
 ### 13.4 Turn-level errors
 
@@ -979,7 +1058,8 @@ interface SessionMeta {
   createdAt: number
   updatedAt: number
   model: string
-  permissionMode: 'trust' | 'cautious'
+  // NOTE (Phase 2a): widened to `'trust' | 'normal' | 'strict'` — `'cautious'` is retired.
+  permissionMode: 'trust' | 'normal' | 'strict'
   planMode: boolean
   triggeredBy: { kind: 'user' } | { kind: 'cron', cronId: string, scheduledFor: number }
   lastSegmentReason: SegmentFinishReason | null   // for restart classification
@@ -1246,20 +1326,28 @@ This is the section codex called out as missing. It is the single most important
    └─ Emits suspension-raised IPC carrying the SuspensionSpec
    └─ Emits segment-finished: reason=suspended
 
-4. Main shows the appropriate card (Plan/Ask/Cautious dialog)
+4. Main shows the appropriate card (Plan / Ask / Permission)
    └─ User makes a decision, possibly minutes later
-   └─ Main sends resolve-suspension IPC
+   └─ Main sends resolve-suspension IPC, optionally with a stateUpdate
+      payload (§12.3) to sync allow-once state into the worker
 
 5. Worker receives resolve-suspension
+   └─ Applies stateUpdate (if any) to session.allowOnceClasses /
+      session.singleUseApprovals BEFORE rewriting the placeholder
    └─ Validates suspensionId matches session.pendingSuspension
    └─ Computes the new tool-result content based on resolution kind
-        - plan-approved → { approved: true }
-        - plan-modified → { approved: true, modified: true }
-        - plan-rejected → { approved: false, reason }
-        - question-answered → the answer object
-        - cautious-allowed → invoke the underlying tool's real execute() now,
-                             use its result
-        - cautious-denied → { error: 'user-denied' }
+        - plan-approved → { resolved: true, approved: true }
+        - plan-modified → { resolved: true, approved: true, modified: true }
+        - plan-rejected → { resolved: true, approved: false, reason }
+        - question-answered → { resolved: true, answer }
+        - permission-allow → { resolved: true }
+        - permission-allow-always → { resolved: true }
+        - permission-deny → { error: 'user-denied' }
+      (Phase 2a note: unlike the old 'cautious-allowed' path, permission-allow
+      does NOT re-invoke the underlying tool here. The LLM re-emits the tool
+      call on the next segment; the second attempt hits checkPermission with
+      the now-populated single-use key or allowlist, and the actual execution
+      happens then. See §12.3 steps 11–14 and Phase 2a spec §8.2.)
    └─ Appends a `part-update` event keyed by (messageId, partIndex) from
         the saved suspension. Replay logic merges it into uiMessages so
         the placeholder is now the real tool-result. The tool_use_id is
@@ -1329,7 +1417,7 @@ The active suspension's placeholder *is* preserved through this sweep because th
 - **Crash during a suspension** (before resolve-suspension arrives): `suspension.json` survives the crash. On restart, the session loads, sees the suspension, re-emits `suspension-raised`, the UI rebuilds the card. The user resolves it as if nothing happened.
 - **Crash mid-resolution**: handled by the resolution write protocol above. Idempotent re-resolution.
 - **User cancels mid-suspension**: `cancel-current-turn` runs the rewrite path with a `{ error: 'user-cancelled', hint: 'User cancelled the pending action.' }` payload, deletes suspension.json, sets `lastSegmentReason='aborted'`, and the session goes idle. No new segment is started. The chat shows a small system notice "Cancelled. Send a new message to continue."
-- **Parallel tool calls in one step that all suspend**: this *is* possible. Vercel AI SDK executes all tool calls from one step in parallel by default. If the model emits, say, two Cautious-gated Bash calls, both dispatcher wrappers will run their `execute()` and try to push to `pendingSuspension`. The session uses a **first-wins queue**:
+- **Parallel tool calls in one step that all suspend**: this *is* possible. Vercel AI SDK executes all tool calls from one step in parallel by default. If the model emits, say, two permission-gated Bash calls, both dispatcher wrappers will run their permission check and try to push to `pendingSuspension`. The session uses a **first-wins queue**:
 
     ```ts
     interface SessionRuntime {
@@ -1345,19 +1433,22 @@ The active suspension's placeholder *is* preserved through this sweep because th
 
     The cleaner alternative — forcing the model to make at most one suspending tool call per step — is not enforceable from the client side without using `toolChoice: 'required'` per tool, which conflicts with normal multi-tool behavior. The deferred-supersede design accepts the ugliness in exchange for correctness.
 
-- **Cautious denial resolved before the actual tool ran**: handled by step 5 of the lifecycle above — Cautious tools' real `execute()` runs *during resolution*, not before suspension.
+- **Permission denial before the tool ran**: handled by step 5 of the lifecycle above. Under the Phase 2a permission model (§12.3), a denied permission means the wrapper records `{ error: 'user-denied' }` as the resolved tool-result and the LLM sees the denial in the next segment's history; the tool itself never runs. (Historically, pre-Phase 2a "cautious" tools used to run their real `execute()` during resolution — that model is retired.)
 
 **Minimal data structures:**
 
 ```ts
 // In-memory
+// NOTE (Phase 2a): `shells` moved out of worker — it's main-side now, owned
+// by src/main/tool-executors/bash.ts per §6.3a Rule 1 (Bash is rpc).
 interface SessionRuntime {
   meta: SessionMeta
   uiMessages: UIMessage[]
   tasks: TaskStore
   pendingSuspension: SuspensionSpec | null     // first-wins, aborts segment
-  deferredSuspensions: SuspensionSpec[]        // parallel-tool-call losers
-  shells: Map<string, RunningShell>
+  deferredSuspensions: SuspensionSpec[]        // parallel-tool-call losers (Phase 2b — Phase 2a uses invariant check instead)
+  allowOnceClasses: Set<ApprovalClass>         // Phase 2a — allow-always allowlist, session-scoped
+  singleUseApprovals: Set<string>              // Phase 2a — single-use permission keys, consumed on hit
   abortController: AbortController | null
   segmentInProgress: boolean
 }
@@ -1366,7 +1457,8 @@ interface SessionRuntime {
 // suspension.json
 interface PersistedSuspension {
   suspensionId: string
-  kind: 'plan' | 'question' | 'cautious'
+  // NOTE (Phase 2a): 'cautious' is retired; its replacement is 'permission'.
+  kind: 'plan' | 'question' | 'permission'
   toolUseId: string                   // the tool_use block this is paired with (for diagnostics)
   messageId: string                   // the assistant message containing the tool-result placeholder
   partIndex: number                   // the part index inside that message — the rewrite target
@@ -1500,50 +1592,60 @@ src/agent/                      # NEW — isolated agent worker code
 │   ├── store.ts                # session directory I/O
 │   ├── suspension.ts           # SuspensionSpec, persistence, resolution helpers
 │   └── resume.ts               # startup enumeration + lazy hydration
-├── tools/
+├── tools/                      # Worker-side tool executors (execution: 'local')
 │   ├── index.ts                # allTools() registry + plan-mode mask
-│   ├── read.ts
-│   ├── write.ts
-│   ├── edit.ts
-│   ├── glob.ts
-│   ├── grep.ts
-│   ├── bash.ts
-│   ├── bash-output.ts
-│   ├── monitor.ts
-│   ├── web-fetch.ts
-│   ├── web-search.ts
-│   ├── task-create.ts
-│   ├── task-update.ts
-│   ├── task-list.ts
-│   ├── task-get.ts
-│   ├── skill.ts
-│   ├── agent.ts
-│   ├── list-projects.ts
-│   ├── ask-user-question.ts
-│   ├── cron-create.ts
-│   ├── cron-list.ts
-│   ├── cron-delete.ts
-│   ├── enter-plan-mode.ts
-│   └── exit-plan-mode.ts
+│   ├── manifest-wrapper.ts     # wrapLocalTool / wrapRpcTool — applies checkPermission, throws SuspensionSignal
+│   ├── check-permission.ts     # §12.2 pure function
+│   ├── suspension-signal.ts    # SuspensionSignal error class
+│   ├── read.ts                 # local / read
+│   ├── glob.ts                 # local / read
+│   ├── grep.ts                 # local / read
+│   ├── web-fetch.ts            # local / read
+│   ├── web-search.ts           # local / read (Phase 2b)
+│   ├── write.ts                # local / write
+│   ├── edit.ts                 # local / write
+│   ├── ask-user-question.ts    # local / ui — control-flow suspending tool (§6.3a)
+│   ├── task-create.ts          # Phase 2b
+│   ├── task-update.ts          # Phase 2b
+│   ├── task-list.ts            # Phase 2b
+│   ├── task-get.ts             # Phase 2b
+│   ├── skill.ts                # Phase 2b
+│   ├── agent.ts                # Phase 2b
+│   ├── cron-create.ts          # Phase 2b
+│   ├── cron-list.ts            # Phase 2b
+│   ├── cron-delete.ts          # Phase 2b
+│   ├── enter-plan-mode.ts      # Phase 2b
+│   └── exit-plan-mode.ts       # Phase 2b
 ├── services/
-│   ├── task-store.ts           # JSONL task persistence
-│   ├── cron.ts                 # node-cron wrapper
-│   ├── shells.ts               # background shell manager (Bash/BashOutput/Monitor)
+│   ├── task-store.ts           # JSONL task persistence (Phase 2b)
+│   ├── cron.ts                 # node-cron wrapper (Phase 2b)
 │   ├── conversation-store.ts   # event log + snapshot + replay (§15.2)
 │   ├── event-log.ts            # LogEvent types, append/fsync, batched writes
 │   └── fs.ts                   # safe file helpers
-├── guards/
-│   └── path-guard.ts           # prevent escape from allowed dirs
 └── skills/
-    ├── loader.ts               # scan ~/.oneship/skills
-    └── frontmatter.ts          # parse SKILL.md YAML
+    ├── loader.ts               # scan ~/.oneship/skills (Phase 2b)
+    └── frontmatter.ts          # parse SKILL.md YAML (Phase 2b)
 
-src/shared/
-└── agent-protocol.ts           # NEW — types for main↔worker IPC (crossed boundary)
+src/shared/                     # Cross-process shared modules
+├── agent-protocol.ts           # types for main↔worker IPC
+├── tool-manifest.ts            # NEW — the shared manifest layer from §6.3a (name / description / inputSchema / execution / approvalClass / summarize). Imported by worker AND main.
+└── tool-guards/                # NEW — pure security checks imported by both worker-side local executors AND main-side rpc executors. Per §6.3a Rule 3.
+    ├── path-guard.ts           # workspace bounds + home-dotfile deny list
+    └── index.ts
 
 src/main/
-├── agent-host.ts               # NEW — utilityProcess lifecycle + IPC client
-└── index.ts                    # modified — register chief.* IPC handlers that forward to AgentHost
+├── agent-host.ts               # utilityProcess lifecycle + IPC client + RPC correlation
+├── permission-policy.ts        # default mode getter/setter + prompt routing; does NOT run checkPermission (that is worker-local per §12.2)
+├── suspension-router.ts        # dispatches suspension-raised → permission.prompt / ask.prompt / plan.prompt
+├── chief-preferences.ts        # API key + model + default permission mode
+├── secret-store.ts             # API key persistence (Phase 2a: config.json 0600; V1: keytar)
+├── tool-executors/             # Main-side rpc executors (execution: 'rpc')
+│   ├── index.ts                # registry keyed on manifest name
+│   ├── bash.ts                 # rpc / exec. Owns the session-scoped shell registry (§6.4)
+│   ├── bash-output.ts          # rpc / read. Phase 2b — reads from main-side shell registry
+│   ├── monitor.ts              # rpc / read. Phase 2b — waits on main-side shell registry
+│   └── list-projects.ts        # rpc / read. Phase 2b
+└── index.ts                    # registers chief.* IPC handlers + suspension-router + tool-executors registry
 
 src/renderer/
 ├── pages/chief-chat.tsx        # modified — use new IPC + UIMessage
