@@ -60,12 +60,14 @@ Phase 2a tightens or clarifies the following points in the parent spec:
 1. **§6.3a is authoritative** for tool execution topology, descriptor schema, and approval-class semantics. Tool descriptors MUST declare `execution` and `approvalClass`; there is no context-dependent third mode. Security logic (path guards etc.) lives in `src/shared/tool-guards/`.
 2. **Permission is unified with the suspension protocol.** The parent spec §15.5 already puts permission on the suspension path ("cautious"); Phase 2a confirms this and rejects the alternative of a separate synchronous RPC for permission. Both `AskUserQuestion` and permission prompts raise a `SuspensionSpec`, end the segment, and resume via `resolve-suspension` + a synthetic user message.
 3. **Permission check runs in the worker.** `checkPermission(mode, approvalClass, allowlist, singleUse)` is a pure function local to the worker. Main owns the policy source of truth (the default permission mode in Preferences, and the `set-permission-mode` IPC), but runtime evaluation happens where the tool is about to execute. This keeps the worker from having to round-trip to main on every `read`-class tool call in trust/normal modes (which is the common case).
-4. **Event log adds `part-rewrite`.** Parent spec §15.2.1 defines four `LogEvent` types. Phase 2a adds a fifth, `part-rewrite`, used by `cleanupOrphanPlaceholders` to replace `{__suspended: true}` placeholders with their resolved value (`{resolved: true}` or `{error: 'user-denied'}`). Replay must handle this new event type.
-5. **Streaming text persistence uses 250ms time-window flush with a final merge.** Parent spec does not specify the flush policy. Phase 2a pins it: `TextFlushScheduler` buffers `text-delta` fragments in memory, flushes a `part-update` event every 250ms, and merges any residual buffer into the final write that precedes `message-finish`. `message-finish` is the only event in the assistant-text path that forces `fsync`.
-6. **Tool call and tool result are stored as two separate parts.** Parent spec §15.2.1 lists `part-append` for tool parts but doesn't explicitly address pairing. Phase 2a pins: `tool-call` and `tool-result` are separate `part-append` events (one each), paired in the UI layer by `toolCallId`. This follows the native shape of Vercel AI SDK `fullStream` and avoids a transformation step in the worker.
-7. **Live tool-exec status is renderer-only.** Phase 2a adds a `tool-exec-status { toolCallId, state: 'running' | 'done' | 'error' }` message sent from worker to main to renderer. It is NOT persisted to the event log. On replay, a tool-call without a corresponding tool-result is rendered as "recovering..." rather than "running".
-8. **Permission `ui` class is pass-through.** `AskUserQuestion` has `approvalClass: 'ui'`, and the permission truth table (§6.3a) routes `ui` to `allow` without prompting. AskCard is raised by the tool itself via the suspension protocol, not by permission gating.
-9. **Single session is strictly serial.** Parent spec §15.4 permits concurrent segments with a semaphore cap of 4. Phase 2a pins one session to one runLoop at a time. A second user message while a runLoop is in flight is rejected with a UI notice. Cross-session concurrency is allowed but not exercised in Phase 2a.
+4. **Permission mode is widened from two values to three.** Parent spec §12.1 and §15.1 define `PermissionMode = 'trust' | 'cautious'`, and Phase 1 ships that exact type in `src/shared/agent-protocol.ts:36`. Phase 2a replaces it with `PermissionMode = 'trust' | 'normal' | 'strict'`. The rename is intentional: "cautious" was a single mode doing two jobs (prompt for write/exec, which `normal` now does; prompt for everything, which `strict` now does). The parent spec's §12.2 "cautious approval flow" is **retired and superseded by §8** of this document. Phase 2a plan must: widen the `PermissionMode` type in `src/shared/agent-protocol.ts`, retire any remaining `'cautious'` string literals, update the parent spec §12 to point at §8, and migrate any in-flight session meta.json that still carries `'cautious'` — Phase 1 hardcodes `'trust'` on session creation and never writes `'cautious'`, so no disk migration is required, only code migration.
+5. **Event log stays at four event types; `part-update` does all placeholder rewrites and text-buffer flushes.** Parent spec §15.2.1 explicitly reserves `part-update` for "tool-result placeholder rewrites" and §15.2.3 explicitly names `part-update` as the event that gets batched for streaming text. Phase 1 already exports the `part-update` schema in `src/agent/services/event-log.ts` and already handles it in `replay()` in `src/agent/services/conversation-store.ts` with the exact bounds check Phase 2a needs. Phase 2a implements `writePartUpdate` (which Phase 1 stubs as `Phase1NotImplemented`) and uses it for both text-delta flushes and suspension-resolved placeholder rewrites. No new event type is introduced.
+6. **Streaming text persistence uses the parent spec's 50ms time-window flush.** Parent §15.2.3 pins it: "the dispatcher batches consecutive `part-update` events targeting the same text part within a 50ms window into a single write". Phase 2a honors this window exactly. `TextFlushScheduler` buffers `text-delta` fragments in memory, flushes a `part-update` event (containing the **accumulated** text-part with all deltas so far) every 50ms, and merges any residual buffer into the final write that precedes `message-finish`. `message-finish` is the only event in the assistant-text path that forces `fsync`.
+7. **Tool call and tool result are stored as two separate parts.** Parent spec §15.2.1 lists `part-append` for tool parts but doesn't explicitly address pairing. Phase 2a pins: `tool-call` and `tool-result` are separate `part-append` events (one each), paired in the UI layer by `toolCallId`. This follows the native shape of Vercel AI SDK `fullStream` and avoids a transformation step in the worker.
+8. **Live tool-exec status is renderer-only.** Phase 2a adds a `tool-exec-status { toolCallId, state: 'running' | 'done' | 'error' }` message sent from worker to main to renderer. It is NOT persisted to the event log. On replay, a tool-call without a corresponding tool-result is rendered as "recovering..." rather than "running".
+9. **Permission `ui` class is pass-through.** `AskUserQuestion` has `approvalClass: 'ui'`, and the permission truth table (§6.3a) routes `ui` to `allow` without prompting. AskCard is raised by the tool itself via the suspension protocol, not by permission gating.
+10. **`SegmentFinishReason` must be widened to include `'tool-calls'`.** Parent spec §5.4 implies a `'tool-calls'` reason ("`runLoop` continues when the last segment finished via tool-calls"), but Phase 1 ships `SegmentFinishReason = 'natural' | 'suspended' | 'step-cap' | 'aborted' | 'error'` in `src/shared/agent-protocol.ts:42` — no `'tool-calls'` value. Phase 2a adds `'tool-calls'` to the union. This is the only field `runSegment` returns that `runLoop` uses to decide continuation. (The parent spec called it "the only continuation condition"; Phase 1 left the literal value out because it had no live LLM to emit it.)
+11. **Single session is strictly serial.** Parent spec §15.4 permits concurrent segments with a semaphore cap of 4. Phase 2a pins one session to one runLoop at a time. A second user message while a runLoop is in flight is rejected with a UI notice. Cross-session concurrency is allowed but not exercised in Phase 2a.
 
 ## 5. Architecture Overview
 
@@ -74,7 +76,7 @@ Phase 2a tightens or clarifies the following points in the parent spec:
 1. **User sends a message.** Renderer → main → worker as `chief:send` IPC. Worker's `Session.appendUserMessage` writes `message-start` + `part-append(text)` + `message-finish` to the event log, then triggers `runLoop(session, abort)`.
 2. **runLoop calls runSegment.** `runSegment` calls `cleanupOrphanPlaceholders(session)` first, then builds system messages via `buildSystemMessages(session)`, builds the tool set via `allTools(session)`, and calls `streamText({ model, messages, tools, stopWhen: stepCountIs(50), abortSignal: combined })`.
 3. **Worker consumes `fullStream`.** For each part type:
-   - `text-delta`: append to `TextFlushScheduler` buffer; flush every 250ms as `part-update`.
+   - `text-delta`: append to `TextFlushScheduler` buffer; flush every 50ms as `part-update` (per parent §15.2.3; the batched event carries the accumulated text part, not a delta).
    - `tool-call`: write `part-append(tool-call)`; send `tool-exec-status { state: 'running' }` to main.
    - `tool-result`: write `part-append(tool-result)`; send `tool-exec-status { state: 'done' | 'error' }`.
    - `finish`: note `finishReason`.
@@ -84,9 +86,9 @@ Phase 2a tightens or clarifies the following points in the parent spec:
    - **allow**: for `execution: 'local'`, run the inner executor; for `execution: 'rpc'`, send `rpc.request { kind: 'tool.exec' }` and await the response.
    - **deny**: return `{ error: 'user-denied' }` as tool-result (no prompt).
    - **prompt-needed**: push a `permission` SuspensionSpec to `session.pendingSuspension`, write a `{__suspended: true}` placeholder tool-result, throw `SuspensionSignal`. `runSegment` catches the signal, persists `suspension.json`, and returns `{ reason: 'suspended' }`.
-5. **Suspending tools (AskUserQuestion).** Same pattern as prompt-needed, but the SuspensionSpec has `kind: 'question'` and the placeholder is written by the tool's own executor, not by the permission wrapper.
+5. **Suspending tools (AskUserQuestion).** The SuspensionSpec has `kind: 'question'`. The `__suspended` placeholder is written before throwing `SuspensionSignal`, and `runSegment` catches it and ends the segment via the same path as a permission prompt. Whether the suspension is raised worker-side (inside the tool wrapper) or main-side (inside the main-process tool executor, which relays a suspension request back to the worker) is an open question — see §6.5 and §17 Q2. The plan task T-05 resolves it before implementation begins; §5.1 intentionally does not take a position.
 6. **runLoop follows finish reason.** `tool-calls` → continue to next segment. Anything else → persist `lastSegmentReason` and return.
-7. **Suspension resolution.** Main's `suspension-router` receives `suspension-raised`, looks at `spec.kind`, dispatches `permission.prompt` or `ask.prompt` to the renderer. Renderer shows the appropriate card. User action → `resolve-suspension` IPC back to main → main updates session state (allowlist additions, singleUseApproval entries) → main forwards `resolve-suspension` to worker → worker appends a synthetic user message to the session history describing the resolution, deletes `suspension.json`, clears `pendingSuspension`, and calls `cleanupOrphanPlaceholders` (which rewrites the `__suspended` placeholder as a `part-rewrite` event) → worker triggers a new `runLoop` iteration.
+7. **Suspension resolution.** Main's `suspension-router` receives `suspension-raised`, looks at `spec.kind`, dispatches `permission.prompt` or `ask.prompt` to the renderer. Renderer shows the appropriate card. User action → `resolve-suspension` IPC back to main → main updates session state (allowlist additions, singleUseApproval entries) → main forwards `resolve-suspension` to worker → worker emits a `part-update` event to replace the `__suspended` placeholder tool-result with its resolved value, appends a synthetic user message to the session history describing the resolution, deletes `suspension.json`, and clears `pendingSuspension` → worker triggers a new `runLoop` iteration. (`cleanupOrphanPlaceholders` is a separate safety net for orphans from crashed sessions; see §9.2 — it does NOT perform the happy-path rewrite.)
 
 ### 5.2 Deferred decisions (flagged not designed)
 
@@ -130,6 +132,29 @@ export const TOOL_MANIFESTS: Record<string, ToolManifest> = {
 ```
 
 Worker imports `TOOL_MANIFESTS` to build its `allTools()` registry (filtering by `execution === 'local'`). Main imports `TOOL_MANIFESTS` to build the `tool-executors` registry (filtering by `execution === 'rpc'`).
+
+### 6.1a Normative `ToolResult` shape
+
+Every tool in Phase 2a returns a value that can be discriminated into exactly one of the following shapes, which `replay()`, the UI, and the LLM must all handle consistently:
+
+```ts
+type ToolResult =
+  | { __suspended: true; suspensionId: string }           // placeholder; replaced via part-update on resolution
+  | { resolved: true; answer?: string }                   // happy-path resolution (ask answered, permission allowed)
+  | { ok: true; data: unknown }                           // tool executed successfully; data is the tool-specific payload
+  | { error: string; hint?: string }                      // tool rejected or failed; error is a stable code or short message
+```
+
+Error codes Phase 2a is expected to emit (non-exhaustive but all must be discriminable):
+- `'user-denied'` — permission was denied
+- `'user-cancelled-question'` — AskUserQuestion cancelled by user
+- `'suspension-orphaned'` — cleanupOrphanPlaceholders reclaimed a stale placeholder
+- `'path-guard: <reason>'` — shared path-guard rejected the path (e.g. `'path-guard: outside workspace'`)
+- `'invalid-args: <reason>'` — zod schema validation failed
+- `'exec-failed: <reason>'` — Bash or similar tool exited with non-zero (hint carries stdout/stderr tail)
+- any tool-specific runtime error, sanitized by sanitize-error.ts
+
+Tools never return raw objects without a discriminator. The wrapper in §6.2 wraps every successful inner execution into `{ok: true, data: <raw>}` and every thrown error into `{error: ...}`. This keeps the UI renderer and the LLM's view of tool output uniform.
 
 ### 6.2 Worker tool wrapper
 
@@ -225,9 +250,10 @@ Each of the seven tools gets its own file. Phase 2a implementations are MVP-shap
 - **Write** (`src/agent/tools/write.ts`): file_path (required), content (required). Always overwrites. Honors path guard. Triggers write approval.
 - **Edit** (`src/agent/tools/edit.ts`): file_path (required), old_string (required), new_string (required), replace_all (optional). Honors path guard. Triggers write approval.
 - **Bash** (`src/main/tool-executors/bash.ts`): cmd (required), cwd (optional, defaults to project root). Uses the existing `TerminalManager` — Phase 2a adds a `runOneShot` method to TerminalManager if one doesn't already exist. Streams stdout/stderr into a string buffer, returns `{ stdout, stderr, exitCode }` when the command exits. Honors an abort signal passed through the rpc envelope. Triggers exec approval.
-- **AskUserQuestion** (`src/main/tool-executors/ask-user-question.ts`): the rpc executor only builds the `ask.prompt` message and forwards it; the actual "ask" logic is the suspension protocol. The rpc tool executor never directly returns — it waits for a `resolve-suspension` message that resolves the tool call. Actually — **re-check**: for `ui` class (pass-through permission), the worker tool wrapper still runs the permission check (which returns `allow`), then sends `rpc.request { kind: 'tool.exec' }` to main, main raises the suspension there. This means `AskUserQuestion` suspends from main-side, not worker-side — matching the design that the executor owns its UI mediation. The SuspensionSpec is constructed in main and sent to the worker via a new `suspension-raised-by-main` message, which the worker records in its own session state. **TODO in plan phase**: decide whether suspension raising for ui-class tools happens on worker or main. Tentative: main raises it and relays via an IPC message.
-
-(The last bullet above flags a real ambiguity that we should resolve during plan writing. The two options are: (a) worker wraps the AskUserQuestion rpc tool and raises suspension worker-side before even sending to main, or (b) main's executor raises suspension on behalf of the worker. I lean (a) — it keeps suspension raising colocated with the tool wrapper and keeps the worker as the single source of truth for `session.pendingSuspension`. Plan task T-05 will finalize this.)
+- **AskUserQuestion** (`src/main/tool-executors/ask-user-question.ts` or `src/agent/tools/ask-user-question.ts`, TBD by plan task T-05): whichever side ends up owning the executor, the net behavior is the same: the tool raises a `{ kind: 'question' }` SuspensionSpec, writes a `__suspended` placeholder tool-result via `part-update`, throws `SuspensionSignal`, and `runSegment` ends the segment. The question-prompt card is dispatched to the renderer by main's `suspension-router` regardless of who raised the suspension. **Open question** (tracked in §17 Q2): does the suspension get raised by the worker's tool wrapper (colocated with other suspending tools) or by the main-side tool executor (colocated with other rpc executors)? Two options, plan task T-05 picks one before implementation starts:
+  - **(a) Worker-raised**: `AskUserQuestion` is wrapped as a local tool in the worker (execution: 'local' despite the manifest saying 'rpc' — or change the manifest to 'local'). Pro: single source of truth for `session.pendingSuspension` on the worker. Con: breaks the "UI tools run in main" heuristic in §6.3a.
+  - **(b) Main-raised**: `AskUserQuestion` is a true rpc tool; worker wrapper sends `rpc.request { kind: 'tool.exec' }`, main's executor raises the suspension via a new `rpc.request { kind: 'suspension.raise' }` back to the worker (which then throws `SuspensionSignal`). Pro: respects §6.3a. Con: new IPC round-trip, slightly more complex state machine.
+  - Plan task T-05's deliverable is a one-sentence decision and the single IPC message type it adds (if any). §5.1 step 5 must be updated to match whichever is chosen before coding begins.
 
 ## 7. Runtime
 
@@ -260,7 +286,7 @@ export async function runSegment(
         case 'text-delta': await flusher.append(part.textDelta); break
         case 'tool-call': await handleToolCall(session, part); break
         case 'tool-result': await handleToolResult(session, part); break
-        case 'finish': return finishSegment(session, flusher, part.finishReason)
+        case 'finish': return await finishSegment(session, flusher, part.finishReason)
       }
     }
   } catch (err) {
@@ -279,6 +305,20 @@ export async function runSegment(
   }
 }
 ```
+
+**`finishSegment(session, flusher, finishReason)` mapping** (per Vercel AI SDK v6 `finishReason` values):
+
+| SDK `finishReason` | Returns | Notes |
+|---|---|---|
+| `'stop'` | `{ reason: 'natural' }` | LLM emitted end-of-turn naturally |
+| `'tool-calls'` | `{ reason: 'tool-calls' }` | runLoop continues to next segment |
+| `'length'` | `{ reason: 'error', error: 'context-length-exceeded' }` | max tokens reached mid-reply; Phase 2a treats as error (Phase 2b auto-compact) |
+| `'content-filter'` | `{ reason: 'error', error: 'content-filter' }` | Anthropic content policy; surface to user |
+| `'tool-calls'` with `stepCountIs(50)` also firing | `{ reason: 'step-cap' }` | Uses the existing Phase 1 `'step-cap'` finish reason value from `SegmentFinishReason` |
+| `'error'` | `{ reason: 'error', error: sanitized }` | SDK-reported stream error; sanitize via existing `sanitize-error.ts` before returning |
+| `'other'` / unknown | `{ reason: 'error', error: 'unknown-finish-reason' }` | Safety fallback; logs the raw value |
+
+In every case, `finishSegment` runs `await flusher.finalFlush()` and `await appendMessageFinish(session)` before returning, to ensure the last text buffer is persisted and the message is marked complete.
 
 ### 7.2 `runLoop` flow
 
@@ -300,12 +340,14 @@ Single while-loop. The rule "tool-calls means continue" is the only continuation
 
 `src/agent/runtime/text-flush.ts`:
 
-- `append(delta)`: adds to internal buffer; if no timer is running, starts a 250ms setTimeout.
-- `flush()`: writes `part-update { messageId, partIndex, delta }` event with the current buffer; clears buffer and timer.
-- `finalFlush()`: clears any pending timer; calls `flush()` synchronously; used at segment end.
-- Per-message-part state: the scheduler is recreated per assistant message; each text part gets its own `partIndex`.
+- `append(delta)`: accumulates the fragment into an internal string buffer; if no timer is running, starts a 50ms `setTimeout`.
+- `flush()`: writes a `part-update { messageId, partIndex, part: { type: 'text', text: <accumulated> } }` event to the event log. The `part` carries the **full accumulated text of this text-part** (parent spec §15.2 shape — `part-update` replaces the part at `partIndex`, it is not a delta patch). Clears the buffer timer but KEEPS the accumulated string — subsequent appends continue to grow it so the next flush sees the whole string, not just new fragments.
+- `finalFlush()`: clears any pending timer; calls `flush()` synchronously; used at segment end to merge residual buffer into the final write before `message-finish`.
+- Per-message-part state: the scheduler is recreated per assistant text part; each text part gets its own `partIndex` and its own accumulated string.
 
-Unit tests (fake timers): short delta → final merge writes once; long delta → multiple flushes at 250ms intervals + final merge; zero delta → no write.
+Event-log shape note: because `part-update` carries the full text each time, crash-time replay automatically gets the latest snapshot of the streaming text up to the last successful flush, no reconciliation needed.
+
+Unit tests (fake timers): short delta → final merge writes once; long delta → multiple flushes at 50ms intervals + final merge; zero delta → no write; accumulation across flushes → second flush carries full string, not just new fragment.
 
 ### 7.4 Error retry
 
@@ -381,9 +423,13 @@ When `checkPermission` returns `prompt-needed`:
    - **Deny**: no state change.
 10. Main sends `resolve-suspension { suspensionId, resolution: { kind: 'permission-allow' | 'permission-allow-always' | 'permission-deny' } }` to worker.
 11. Worker appends a synthetic user message to the session: `"[User decision on prior tool call: allow|deny]"`. (Plan task will finalize exact wording; the key constraint is that the LLM sees a normal user turn, not an assistant correction.)
-12. Worker calls `cleanupOrphanPlaceholders(session)` which emits a `part-rewrite` event replacing `{__suspended: true}` with `{resolved: true}` or `{error: 'user-denied'}`.
+12. Worker emits a single `part-update` event that replaces the `{__suspended: true, suspensionId}` tool-result placeholder at its known `(messageId, partIndex)` with the resolved value: `{resolved: true, answer: '...'}` for questions, `{resolved: true}` for permission-allow, or `{error: 'user-denied'}` for permission-deny. This explicit rewrite owns the happy-path transition. `cleanupOrphanPlaceholders` is NOT called here — see §9.2 for the invariant.
 13. Worker deletes `suspension.json`, clears `pendingSuspension`.
-14. Worker triggers a new `runLoop` iteration. If resolution was `allow` or `allow-always`, the LLM typically re-emits the same tool call, which this time passes `checkPermission` (via allowlist or single-use) and executes.
+14. Worker triggers a new `runLoop` iteration. The LLM is now free to re-emit the same tool call, a modified tool call, or a different tool call entirely — the model makes its own decision based on what the synthetic user message tells it.
+    - If the LLM re-emits **byte-identical args** and resolution was `permission-allow`, `checkPermission` hits the `singleUseApprovals` entry (consumed on hit) and the tool executes.
+    - If the LLM re-emits with **any difference in args** (whitespace, reordering, partial edit), the single-use key misses and a fresh permission prompt is raised. This is the intended safe behavior — see §8.3. A plan writer reading this section MUST NOT assume the re-emit is guaranteed; the test cases in §14.1 item 4 validate the identical-args path and item 5 validates the allow-always path where arg differences don't matter.
+    - If resolution was `permission-allow-always`, the approvalClass is in `allowOnceClasses`, so any subsequent tool call of the same class (identical args or not) passes `checkPermission` without further prompts.
+    - If resolution was `permission-deny`, the LLM sees `{error: 'user-denied'}` in history and typically chooses a different approach; no auto-retry is attempted by runLoop.
 
 ### 8.3 Single-use approval key collisions
 
@@ -423,9 +469,15 @@ Phase 2a has real handlers for the four non-`plan-*` resolution kinds. The plan-
 
 ### 9.2 `cleanupOrphanPlaceholders`
 
-Runs at the start of every `runSegment`. Walks the session's uiMessages looking for `tool-result` parts where `result.__suspended === true` and `suspensionId` does not match the current `pendingSuspension.suspensionId`. For each orphan, emits a `part-rewrite` event that replaces the part with `{ error: 'suspension-orphaned' }` (this is a bug state — should never happen in a healthy run, but is recoverable).
+**Invariant (must hold):** two code paths rewrite `__suspended` placeholders, and they never operate on the same placeholder:
 
-The happy path is different: when a suspension is resolved, the worker explicitly emits a `part-rewrite` to replace that one placeholder with its real result (`{ resolved: true, answer: '...' }` for questions, `{ resolved: true }` or `{ error: 'user-denied' }` for permission). `cleanupOrphanPlaceholders` is the safety net for edge cases (crash during resolution, etc.).
+1. **Happy-path explicit rewrite** (§8.2 step 12): when a suspension resolves, the resolution handler emits one `part-update` targeting exactly the `(messageId, partIndex)` recorded on the `SuspensionSpec`. This handles the one placeholder whose resolution just arrived.
+
+2. **Orphan sweep**: `cleanupOrphanPlaceholders(session)` runs at the start of every `runSegment`. It walks the session's uiMessages looking for `tool-result` parts where `result.__suspended === true` AND `result.suspensionId` does NOT match `session.pendingSuspension?.suspensionId`. These are **orphans** — placeholders for suspensions that no longer exist (because a crash interrupted their resolution, or a manual `suspension.json` delete left the disk state inconsistent). For each orphan, the sweep emits a `part-update` that replaces the part with `{ error: 'suspension-orphaned' }`.
+
+The guarantee: the explicit path (1) runs before `cleanupOrphanPlaceholders`, and the explicit path clears `session.pendingSuspension`. By the time the sweep runs at the next `runSegment`, the newly-resolved placeholder is no longer a placeholder — it's already been rewritten to its resolved value. The sweep will never re-touch it.
+
+Orphans should not appear in a healthy run. When they do, the `{ error: 'suspension-orphaned' }` result shows up in the LLM history as a regular tool-error, the model decides how to proceed, and the session remains usable.
 
 ### 9.3 `suspension.json` persistence
 
@@ -440,7 +492,7 @@ On session open, if `suspension.json` exists, the session is in the "suspended" 
 `src/renderer/src/components/chief-chat/chief-chat.tsx`: original Phase 1 code is rewritten in place to:
 
 - Remove all dependence on the `appendAssistantStubReply` path.
-- Subscribe to `chief:event` IPC for both persistent events (message-start/part-append/part-update/part-rewrite/message-finish) and renderer-only events (tool-exec-status).
+- Subscribe to `chief:event` IPC for both persistent events (message-start/part-append/part-update/message-finish) and renderer-only events (tool-exec-status).
 - Maintain an in-memory message list built by replaying events since Phase 1 already has event-log→UIMessage replay logic — reuse it.
 - Render each message via `message.tsx`, which reduces `parts[]` into `RenderNode[]` (pairing tool-call with tool-result by toolCallId) and renders each node with the appropriate component.
 
@@ -553,9 +605,9 @@ Calls into `TerminalManager` for one-shot command execution. Plan task should ve
 
 Abort: the executor listens for `rpc.cancel` messages and kills the child process group.
 
-### 11.5 `tool-executors/ask-user-question.ts`
+### 11.5 `ask-user-question` executor (location TBD)
 
-Receives the tool-exec request, delegates to the suspension-router path (sends `ask.prompt` to renderer and suspends via worker's suspension channel, not by blocking). See §6.5 TODO for the final wiring decision.
+Exact wiring depends on plan task T-05 (§6.5). File lives in `src/main/tool-executors/ask-user-question.ts` if main-raised, or `src/agent/tools/ask-user-question.ts` if worker-raised. Either way, the behavior delivered is: the tool raises a `question` SuspensionSpec, main's `suspension-router` dispatches `ask.prompt` to the renderer, renderer shows the AskCard, user answers, resolution arrives via `resolve-suspension`, worker writes the explicit `part-update` rewrite per §8.2 step 12 with the answer.
 
 ## 12. IPC Protocol Extensions
 
@@ -565,6 +617,7 @@ New message types added to `src/shared/agent-protocol.ts`:
 - `suspension-raised { sessionId, spec: SuspensionSpec }`
 - `rpc.request { kind: 'tool.exec', requestId, payload }`
 - `rpc.cancel { requestId }`
+- `tool-exec-status { sessionId, toolCallId, state: 'running' | 'done' | 'error' }` — renderer-only live status, relayed through main via `chief:event`; NOT persisted to the event log
 
 **Main → Worker**
 - `resolve-suspension { sessionId, suspensionId, resolution: SuspensionResolution }`
@@ -585,25 +638,43 @@ All RPC messages share one correlation table in `AgentHost` (keyed by `requestId
 
 ## 13. Persistence Deltas
 
-### 13.1 New `part-rewrite` event
+### 13.1 No new event type; `part-update` is extended in use, not shape
 
-```ts
-{ type: 'part-rewrite', messageId, partIndex, part: AgentUIMessagePart, timestamp }
-```
+Phase 2a does not add a new `LogEvent` type. The existing four from Phase 1 (`message-start`, `part-append`, `part-update`, `message-finish`) are sufficient. Phase 2a only does two things that Phase 1 did not:
 
-Replay rule: on encountering `part-rewrite`, replace the part at `(messageId, partIndex)` entirely. If the message doesn't exist or the index is out of range, log a warning and skip (don't throw — replay must be tolerant).
+1. **Implements `writePartUpdate`** — Phase 1 declared it as a `Phase1NotImplemented` throw in `src/agent/services/conversation-store.ts:156`. Phase 2a fills it in. Same schema, same bounds check as the existing `part-update` replay case in `conversation-store.ts:52`.
+
+2. **Begins using `part-update` for two purposes:**
+   - **Streaming text flushes** (§7.3): the 50ms `TextFlushScheduler` batches accumulated text and writes one `part-update` carrying the full text of the assistant text-part so far. Replay already handles this correctly — each `part-update` replaces the part at `partIndex`, so the last `part-update` wins, which is exactly the snapshot we want.
+   - **Suspension placeholder rewrites** (§8.2 step 12, §9.2): both the happy-path explicit rewrite and the orphan sweep emit `part-update` events that replace `{__suspended: true, ...}` placeholders with their final resolved values.
+
+Replay tolerance stays exactly as Phase 1 left it: out-of-range `partIndex` is silently dropped, per the guard in `conversation-store.ts:59`. Phase 2a does NOT change this behavior (do not add `console.warn` in `replay()` unless Phase 1's silent-drop is upgraded at the same time; keep them harmonized).
 
 ### 13.2 `suspension.json` schema
 
 One JSON file per session directory. Contains the full `SuspensionSpec`. Atomic write (tmpfile + rename). Deleted on resolution.
 
-### 13.3 `SessionMeta` additions
+### 13.3 `SessionMeta` additions and in-memory state summary
 
-Phase 1's SessionMeta already has `permissionMode`, `lastSegmentReason`, and `model`. Phase 2a:
+Phase 1's `SessionMeta` already has `permissionMode` (currently typed `'trust' | 'cautious'`), `lastSegmentReason`, and `model`. Phase 2a:
 
-- `model`: changes default from `'phase1-stub'` to whatever the session was opened with. New sessions read default from Preferences.
-- `permissionMode`: actual runtime value, no longer hardcoded. New sessions read default from Preferences.
-- No new fields in meta.json. `allowOnceClasses`, `singleUseApprovals`, `pendingSuspension` are in-memory only (except `pendingSuspension` which has its own `suspension.json`).
+- `model`: default changes from `'phase1-stub'` to whatever OpenRouter model the session was opened with. New sessions read the default from `chief-preferences`.
+- `permissionMode`: widened to `'trust' | 'normal' | 'strict'` (see §4 delta 4). New sessions read the default from `chief-preferences`.
+- `SegmentFinishReason`: widened to include `'tool-calls'` (see §4 delta 10).
+
+**No new persisted fields in `meta.json`.** All new session state is in-memory, with one exception (`pendingSuspension`) that has its own persistence via `suspension.json`.
+
+Phase 2a session in-memory state (not in meta.json):
+
+| Field | Type | Scope | Persisted? |
+|---|---|---|---|
+| `allowOnceClasses` | `Set<ApprovalClass>` | per runtime Session | No — cleared on worker restart and on mode change |
+| `singleUseApprovals` | `Set<string>` | per runtime Session | No — consumed on hit |
+| `pendingSuspension` | `SuspensionSpec \| null` | per runtime Session | Yes, via `suspension.json` (one file per session) |
+| `currentRunPromise` | `Promise<void> \| null` | per runtime Session | No — used for single-session serialization (§13.4) |
+| `currentAbortController` | `AbortController \| null` | per runtime Session | No — used for cancel-current-turn wiring |
+
+These five fields live on the worker's `Session` class instance and are set/cleared via explicit helper methods (not direct assignment). Tests exercise these helpers, not the raw fields.
 
 ### 13.4 Single-session serialization
 
@@ -617,25 +688,33 @@ Session holds `currentRunPromise: Promise<void> | null`. `appendUserMessage + ru
 
 Mock Vercel AI SDK `streamText` to return a controllable async iterator. Cover at minimum these branches in `runSegment` / `runLoop`:
 
-1. Natural finish: text-delta events → finish with reason='stop' → segment returns natural.
-2. Tool call happy path: text-delta → tool-call → local tool executes → tool-result → more text → finish='tool-calls' → runLoop continues → next segment finishes natural.
-3. Suspension raised by permission prompt: tool-call → checkPermission returns prompt-needed → SuspensionSignal → runSegment returns suspended → runLoop returns.
-4. Suspension raised by AskUserQuestion: same flow but kind='question'.
-5. External abort: runSegment mid-stream → abortSignal fires → returns aborted.
-6. Retryable error (429): streamText throws → retry layer backoff → second attempt succeeds.
-7. Non-retryable error (401): streamText throws → returns error without retry.
-8. Loop continuation rule: finishReason='tool-calls' without actual new tool_calls MUST still re-enter segment (invariant test).
-9. Permission denied path: checkPermission returns prompt-needed → suspension → resolve-deny → cleanupOrphanPlaceholders rewrites to `{error: 'user-denied'}` → new segment.
-10. `tool-exec-status` is sent but not persisted: assert the event log contains no `tool-exec-status` entries after a successful tool call.
+1. **Natural finish**: text-delta events → finish with reason='stop' → segment returns natural.
+2. **Tool call happy path**: text-delta → tool-call → local tool executes → tool-result → more text → finish='tool-calls' → runLoop continues → next segment finishes natural.
+3. **Permission prompt → deny → resumed segment**: tool-call → checkPermission returns prompt-needed → SuspensionSignal → runSegment returns suspended → resolve-suspension 'permission-deny' → explicit `part-update` rewrites placeholder to `{error: 'user-denied'}` → synthetic user message appended → new runLoop iteration → next segment returns natural without re-trying the tool.
+4. **Permission prompt → allow → resumed segment re-emits tool call → tool actually executes**: like (3) but resolution is `permission-allow` → singleUseApprovals gets the key → new segment → LLM re-emits identical tool call → checkPermission hits singleUse → returns allow → inner executor runs → tool-result real value. This is the most subtle path in the whole spec; it validates the single-use consumption AND the synthetic-user-message-triggers-re-emit round-trip.
+5. **Permission prompt → allow-always → two subsequent tool calls of same class run without prompting**: resolution is `permission-allow-always` → allowOnceClasses gets the approvalClass → next segment's first tool call hits allowlist, runs without SuspensionSignal → second tool call of same class also runs without SuspensionSignal.
+6. **Suspension raised by AskUserQuestion**: same flow but `kind: 'question'`; resolution is `question-answered`; the happy-path explicit `part-update` replaces the placeholder with `{resolved: true, answer: '...'}`.
+7. **External abort mid-stream**: runSegment mid-stream → externalAbort.abort() → returns aborted.
+8. **Cancel during suspension**: runSegment suspended → externalAbort.abort() arrives before user responds → permission card is cancelled → session returns to idle with synthetic "[User cancelled]" user message.
+9. **Retryable error (429) succeeds on second attempt**: streamText throws 429 → retry layer backoff 200ms → second attempt returns normal finish.
+10. **Retry exhaustion**: streamText throws 429 three times in a row → retry layer gives up → returns `{reason: 'error', error: 'rate-limited'}`.
+11. **Non-retryable error (401)**: streamText throws 401 → returns error immediately without retry → error message includes sanitized "invalid API key".
+12. **Step-cap**: mock `finishReason='tool-calls'` with 50 consecutive tool-call steps → `stopWhen` fires → returns `{reason: 'step-cap'}`.
+13. **Loop continuation invariant**: finishReason='tool-calls' without actual new tool_calls in the stream (pathological SDK behavior) MUST still re-enter segment — runLoop does not special-case "empty tool_calls".
+14. **`tool-exec-status` not persisted**: assert the event log after a complete tool call contains only `message-start`, `part-append(text)`, `part-append(tool-call)`, `part-append(tool-result)`, `message-finish` — no `tool-exec-status`.
+15. **`length` finish reason**: streamText emits `finishReason='length'` → returns `{reason: 'error', error: 'context-length-exceeded'}`.
+16. **`content-filter` finish reason**: streamText emits `finishReason='content-filter'` → returns `{reason: 'error', error: 'content-filter'}`.
 
 Additional pure-function coverage:
 
 - `checkPermission` truth table: 3 modes × 4 classes × (in allowlist, in single-use, neither) = 36 cases, all asserted.
-- `TextFlushScheduler` timing: with fake timers, verify the 250ms flush, final merge, and zero-delta no-op behaviors.
-- `singleUseKey(toolName, args)` stability: same args → same key; different args → different key.
-- Path guard: allowed paths, denied paths (home dotfiles), relative path rejection, absolute path acceptance.
-- Retry classification: 429, 529, 401, 400, network timeout, abort — each classified correctly.
-- `cleanupOrphanPlaceholders`: orphan → rewrite to error; current suspension's placeholder → untouched.
+- `TextFlushScheduler` timing: with fake timers, verify 50ms flush, final merge, zero-delta no-op, and the accumulation-across-flushes property (second flush writes the full accumulated string, not just the new fragment).
+- `singleUseKey(toolName, args)` stability: same args → same key; different args → different key; key order-stable (e.g., `{a:1,b:2}` and `{b:2,a:1}` → same key).
+- Path guard: allowed paths, denied paths (home dotfiles), relative path rejection, absolute path acceptance, `/tmp` and `/private/tmp` (macOS realpath) both resolve to the same allowed workspace check.
+- Retry classification: 429, 529, 401, 400, network timeout (ECONNRESET, ETIMEDOUT), abort, generic error — each classified correctly.
+- `cleanupOrphanPlaceholders`: orphan → rewrite to error; current suspension's placeholder → untouched; multiple orphans → multiple rewrites; no orphans → no writes.
+
+**Parallel tool-calls invariant (Phase 2a constraint, tested as invariant):** Phase 2a's design assumes at most one `pendingSuspension` per session. If the LLM emits two parallel tool calls in the same step and BOTH of them trigger `prompt-needed`, the second `SuspensionSignal` throw will find `session.pendingSuspension` already populated. The runSegment outer catch must detect this collision, log a hard error, end the segment with `{reason: 'error', error: 'parallel-suspension-not-supported'}`, and leave the first suspension intact on disk. Test 17: two parallel `Write` tool-calls in one segment → second raises error; first proceeds through normal resolution flow. (Parent spec §15.5's `deferredSuspensions` queue is the proper long-term fix; it is deferred to Phase 2b. In Phase 2a's seven-tool world the collision is extremely unlikely — the LLM rarely parallelizes writes — but the invariant check must exist.)
 
 ### 14.2 Smoke test (opt-in, not in CI)
 
@@ -730,7 +809,7 @@ src/agent/runtime/retry.ts            # fill in withRetry
 src/agent/context/system-prompt.ts    # fill in buildSystemMessages
 src/agent/ipc/rpc-client.ts           # fill in rpcCall
 src/agent/session/session.ts          # + allowOnceClasses / singleUseApprovals / pendingSuspension; DELETE appendAssistantStubReply
-src/agent/services/event-log.ts       # + part-rewrite support
+src/agent/services/event-log.ts       # no schema change; verify no regression with the new usage patterns
 src/agent/services/conversation-store.ts  # DELETE (if not referenced) or strip Phase1NotImplemented
 src/main/agent-host.ts                # + rpc handling, resolve-suspension, set-permission-mode
 src/main/index.ts                     # register suspension-router, permission-reconciler, tool-executors; Preferences menu
